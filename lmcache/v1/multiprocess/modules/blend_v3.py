@@ -72,6 +72,12 @@ logger = init_logger(__name__)
 #: call sites), so the log costs nothing after the first occurrence of each.
 _NOOP_REASONS_SEEN: set[str] = set()
 
+#: No-op reasons that dropped nothing: the ranges were scattered by an earlier
+#: retrieve for this worker, so reuse is intact. These are logged but never
+#: published as CB_RETRIEVE_NOOP, keeping that event (and the metric it feeds)
+#: a signal that reuse was actually lost.
+_BENIGN_NOOP_REASONS = frozenset({"already_applied"})
+
 # Plan-then-execute retrieve: one native call enqueues all fill/rope/scatter
 # in a single GIL release, with the plan encoded as numpy int64 tables (one
 # pybind crossing). The Python wave loop stays as fallback for c_ops builds
@@ -195,6 +201,9 @@ class _CBUnifiedJob:
     l2_keys: int = 0  # sparse keys needing an L2 load (0 => no L2 read, span skipped)
     coord_submitted: bool = False  # coordinator match query was issued
     coord_deadline: float = 0.0  # time.monotonic() wall-clock cutoff for the leg
+    # Either leg found no CB KV-cache layout for (model, world_size), so the
+    # request cannot blend at all. Reported on CB_LOOKUP_END.
+    no_gpu_context: bool = False
 
 
 class BlendTokenRangeMatcherV3:
@@ -583,7 +592,10 @@ class BlendV3Module(InstanceLivenessTarget):
         self._cb_jobs_lock = threading.Lock()
 
         # Async fingerprint registration: store enqueues, worker drains.
-        _FpJob = tuple[list[int], list[bytes], int, int]
+        # (tokens_in_range, chunk_hashes, start_chunk_idx, position_offset,
+        # request_id). The request_id is the enqueuing store's, so the
+        # registration event is attributed to it rather than to the drainer.
+        _FpJob = tuple[list[int], list[bytes], int, int, str]
         self._fingerprint_queue: "Queue[_FpJob]" = Queue()
         self._fingerprint_stop = threading.Event()
         self._fingerprint_worker = threading.Thread(
@@ -861,7 +873,7 @@ class BlendV3Module(InstanceLivenessTarget):
                 job = self._fingerprint_queue.get_nowait()
             except QueueEmpty:
                 break
-            tokens_in_range, chunk_hashes, start_chunk_idx, position_offset = job
+            tokens_in_range, chunk_hashes, start_chunk_idx, position_offset, rid = job
             try:
                 self._token_range_matcher.on_new_token_hashes(
                     tokens_in_range,
@@ -869,8 +881,41 @@ class BlendV3Module(InstanceLivenessTarget):
                     start_chunk_idx=start_chunk_idx,
                     position_offset=position_offset,
                 )
+                self._emit_fingerprints_registered(
+                    rid, chunk_hashes, start_chunk_idx, tokens_in_range
+                )
             except Exception:
                 logger.exception("CB fingerprint registration failed (sync drain)")
+
+    def _emit_fingerprints_registered(
+        self,
+        rid: str,
+        chunk_hashes: list[bytes],
+        start_chunk_idx: int,
+        tokens_in_range: list[int],
+    ) -> None:
+        """Publish CB_FINGERPRINTS_REGISTERED for one drained registration job.
+
+        Must be called after ``on_new_token_hashes`` returns, so the reported
+        ``num_chunks`` counts only chunks actually indexed into the match table
+        (it excludes the ``start_chunk_idx`` chunks the store skipped).
+
+        Args:
+            rid: Request ID of the store that enqueued the job.
+            chunk_hashes: The job's per-chunk storage keys.
+            start_chunk_idx: Index of the first chunk that was registered.
+            tokens_in_range: The stored tokens the hashes cover.
+        """
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.CB_FINGERPRINTS_REGISTERED,
+                session_id=rid,
+                metadata={
+                    "num_chunks": max(len(chunk_hashes) - start_chunk_idx, 0),
+                    "num_tokens": len(tokens_in_range),
+                },
+            )
+        )
 
     def _match_fingerprints(self, key: IPCCacheServerKey) -> list[CBMatchResult]:
         """Drain pending registrations and fingerprint-match sub-sequences.
@@ -1081,7 +1126,7 @@ class BlendV3Module(InstanceLivenessTarget):
         key: IPCCacheServerKey,
         tp_size: int,
         policy: TrimPolicy,
-    ) -> "tuple[PrefetchHandle | None, int]":
+    ) -> "tuple[PrefetchHandle | None, int, bool]":
         """Submit the CB prefix prefetch (non-blocking).
 
         Opens the ``cb.prefix_lookup`` span (CB namespace — CB requests no longer
@@ -1098,8 +1143,10 @@ class BlendV3Module(InstanceLivenessTarget):
             policy (TrimPolicy): ``PREFIX`` or ``SEGMENTED_PREFIX``.
 
         Returns:
-            tuple: ``(handle, world_size)``. ``handle`` is None when there is no
-            GPU context or no full chunk (the poll then reports 0 coverage).
+            tuple: ``(handle, world_size, no_gpu_context)``. ``handle`` is None
+            when there is no GPU context or no full chunk (the poll then reports
+            0 coverage); ``no_gpu_context`` is True only for the former, and is
+            reported on CB_LOOKUP_END.
         """
         rid = key.request_id
         model_name, world_size = key.model_name, key.world_size
@@ -1114,11 +1161,11 @@ class BlendV3Module(InstanceLivenessTarget):
                 model_name,
                 world_size,
             )
-            return None, world_size
+            return None, world_size, True
 
         chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(list(key.token_ids))
         if not chunk_hashes:
-            return None, world_size
+            return None, world_size, False
 
         # Lookup-hash logger (chunk hashes, for debug); guarded so the metadata
         # dict is built only when a subscriber is listening.
@@ -1156,7 +1203,7 @@ class BlendV3Module(InstanceLivenessTarget):
             ),
             external_request_id=rid,
         )
-        return handle, world_size
+        return handle, world_size, False
 
     def _poll_prefix_leg(
         self, job: "_CBUnifiedJob", rid: str, segmented: bool
@@ -1259,7 +1306,7 @@ class BlendV3Module(InstanceLivenessTarget):
             # Prefix leg: blend_v3 owns the submit + the cb.prefix_lookup span
             # (under cb.lookup); prefix hit tokens land on the CB hit-rate
             # metric via CB_LOOKUP_END below.
-            prefix_handle, prefix_ws = self._submit_prefix_leg(
+            prefix_handle, prefix_ws, prefix_no_ctx = self._submit_prefix_leg(
                 key, tp_size, prefix_policy
             )
             # Local and coordinator matching are mutually exclusive: with a
@@ -1290,6 +1337,7 @@ class BlendV3Module(InstanceLivenessTarget):
                 num_tokens=len(key.token_ids),
                 prefix_handle=prefix_handle,
                 prefix_world_size=prefix_ws,
+                no_gpu_context=prefix_no_ctx,
             )
             job.coord_submitted = self._submit_coordinator_match(key)
             if job.coord_submitted and self._coordinator is not None:
@@ -1379,6 +1427,7 @@ class BlendV3Module(InstanceLivenessTarget):
                         key.model_name,
                         key.world_size,
                     )
+                    job.no_gpu_context = True
                     job.non_prefix = []
             job.sparse_started = True
 
@@ -1453,7 +1502,7 @@ class BlendV3Module(InstanceLivenessTarget):
                     "prefix_chunks": job.prefix_chunks,
                     "storage_hits": len(found),
                     "stale_chunks": len(job.non_prefix or []) - len(found),
-                    "no_gpu_context": False,
+                    "no_gpu_context": job.no_gpu_context,
                     "prefix_hit_tokens": prefix_tokens,
                     "segmented_prefix_hit_tokens": seg_tail_tokens,
                     "non_prefix_hit_tokens": non_prefix_hit_tokens,
@@ -1507,6 +1556,8 @@ class BlendV3Module(InstanceLivenessTarget):
         # Enqueue on cupy_stream so CUDA FIFO ordering puts registration
         # after the L1-commit callback; otherwise lookups see the chunk as
         # not-yet-committed and drop the whole group as stale.
+        chunk_hashes: list[bytes] = []
+        tokens_in_range: list[int] = []
         try:
             session = self._ctx.session_manager.get_or_create(key.request_id)
             chunk_hashes = [
@@ -1517,7 +1568,13 @@ class BlendV3Module(InstanceLivenessTarget):
                 return result
             tokens_in_range = list(key.token_ids)[key.start : key.end]
             start_chunk_idx = 1 if key.start == 0 else 0
-            job = (tokens_in_range, chunk_hashes, start_chunk_idx, key.start)
+            job = (
+                tokens_in_range,
+                chunk_hashes,
+                start_chunk_idx,
+                key.start,
+                key.request_id,
+            )
             with self._pending_fp_lock:
                 self._pending_fp_hashes.update(chunk_hashes[start_chunk_idx:])
             entry = self._transfer_module.get_and_touch_context_entry(instance_id)
@@ -1650,13 +1707,16 @@ class BlendV3Module(InstanceLivenessTarget):
                 job = self._fingerprint_queue.get(timeout=0.1)
             except QueueEmpty:
                 continue
-            tokens_in_range, chunk_hashes, start_chunk_idx, position_offset = job
+            tokens_in_range, chunk_hashes, start_chunk_idx, position_offset, rid = job
             try:
                 self._token_range_matcher.on_new_token_hashes(
                     tokens_in_range,
                     chunk_hashes,
                     start_chunk_idx=start_chunk_idx,
                     position_offset=position_offset,
+                )
+                self._emit_fingerprints_registered(
+                    rid, chunk_hashes, start_chunk_idx, tokens_in_range
                 )
             except Exception:
                 logger.exception("CB fingerprint registration failed (async)")
@@ -2201,26 +2261,44 @@ class BlendV3Module(InstanceLivenessTarget):
 
         _retrieve_t0 = time.perf_counter()
 
-        def _noop_success(reason: str = "?") -> tuple[bytes, bool]:
-            """Zero-work success return: must export a fresh recorded event
-            from THIS process -- echoing the caller's own handle back makes
-            the worker re-import it (CUDA "invalid device context").
+        def _noop_success(reason: str = "?", detail: str = "") -> tuple[bytes, bool]:
+            """Return a zero-work success, publishing CB_RETRIEVE_NOOP.
 
-            ``reason`` is logged once per distinct value. Every one of these
-            paths silently turns a matched request into a full recompute --
-            recall stays correct, only the speedup vanishes -- so a run that
-            drops all its matches is otherwise indistinguishable from a
-            working one except by its TTFT. Logging the reason is what makes
-            "CB engaged but was not faster" diagnosable.
+            The request silently falls back to a full recompute, so the event is
+            the only signal that reuse was lost; it is skipped for the reasons
+            in ``_BENIGN_NOOP_REASONS``, which dropped nothing. Exports a freshly
+            recorded event from THIS process -- echoing the caller's own handle
+            back makes the worker re-import it (CUDA "invalid device context").
+
+            Args:
+                reason: Fixed low-cardinality code, published as a metric
+                    attribute and logged once per distinct value.
+                detail: Per-request specifics; log-only, never a metric
+                    attribute.
+
+            Returns:
+                tuple[bytes, bool]: A fresh scatter-complete handle, and True.
             """
             if reason not in _NOOP_REASONS_SEEN:
                 _NOOP_REASONS_SEEN.add(reason)
                 logger.info(
-                    "CB v3 retrieve: no-op success (%s) — %d match(es) dropped, "
+                    "CB v3 retrieve: no-op success (%s%s) — %d match(es) dropped, "
                     "request falls back to full recompute. Logged once per "
                     "distinct reason.",
                     reason,
+                    f": {detail}" if detail else "",
                     len(cb_match_result),
+                )
+            if reason not in _BENIGN_NOOP_REASONS:
+                self._event_bus.publish(
+                    Event(
+                        event_type=EventType.CB_RETRIEVE_NOOP,
+                        session_id=key.request_id,
+                        metadata={
+                            "reason": reason,
+                            "dropped_matches": len(cb_match_result),
+                        },
+                    )
                 )
             with (
                 torch_dev.device(gpu_context.device),
@@ -2252,7 +2330,7 @@ class BlendV3Module(InstanceLivenessTarget):
                 if (r.hash, r.cur_st, r.cur_ed) not in prior_applied
             ]
             if not cb_match_result:
-                return _noop_success("all ranges already applied for this worker")
+                return _noop_success("already_applied")
         applied_now: "set[tuple[bytes, int, int]]" = set()
         # Partial-alloc first call: every match can be beyond the allocated
         # slots -> return before the obj-key machinery. Read locks stay held
@@ -2268,7 +2346,9 @@ class BlendV3Module(InstanceLivenessTarget):
             if slot_bound is not None and all(
                 r.cur_ed > slot_bound for r in cb_match_result
             ):
-                return _noop_success(f"every match beyond slot_bound={slot_bound}")
+                return _noop_success(
+                    "beyond_slot_bound", f"every match beyond slot_bound={slot_bound}"
+                )
         # L2 opt: reuse lookup's obj_keys cache; fall back to re-resolve.
         with self._lookup_obj_keys_lock:
             cached = self._lookup_obj_keys_cache.pop(key.request_id, None)
@@ -2310,7 +2390,7 @@ class BlendV3Module(InstanceLivenessTarget):
         if not all_obj_keys:
             # Same latent hazard as the guards above: this used to echo the
             # caller's own event handle back.
-            return _noop_success("no object keys resolved for the matches")
+            return _noop_success("no_object_keys")
 
         logger.debug("CB V3 retrieving object keys: %s", all_obj_keys)
 
@@ -2361,6 +2441,21 @@ class BlendV3Module(InstanceLivenessTarget):
                 resolved_groups.append((block_ids_per_group_gpu[eg_idx], group_bs))
                 cpu_block_tables.append((block_ids_np[eg_idx], group_bs))
 
+            # CPU-synchronous sentinel holding cb.request open across the GPU
+            # work, so a CB_REQUEST_END from another worker's no-op retrieve
+            # cannot close the root early. expects_store_final=False because V3
+            # closes the root on the last CB_RETRIEVE_END instead.
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.CB_RETRIEVE_SUBMITTED,
+                    session_id=key.request_id,
+                    metadata={
+                        "instance_id": instance_id,
+                        "expects_store_final": False,
+                    },
+                )
+            )
+
             self._event_bus.publish_on_stream(
                 gpu_context.cupy_stream,
                 Event(
@@ -2389,15 +2484,34 @@ class BlendV3Module(InstanceLivenessTarget):
             # exec = native kernel enqueue (H2D + re-RoPE + scatter).
             _stage_ms: dict[str, float] = {}
             _stage_t = time.perf_counter()
+            # cb.scatter opens mid-try; track it so a failure closes the span.
+            scatter_open = False
             try:
                 with self._ctx.storage_manager.read_prefetched_results(
                     all_obj_keys
                 ) as memory_objs:
                     _stage_ms["fetch"] = (time.perf_counter() - _stage_t) * 1000
                     if memory_objs is None:
-                        # Read failed: return a valid server event + False, never
-                        # the client's own handle (self-import raises
-                        # cudaErrorDeviceUninitialized, crashing TP).
+                        # Read failed: close the retrieve span and end the
+                        # request, else cb.retrieve leaks and the failure never
+                        # reaches retrieve_failures. Return a valid server event
+                        # + False, never the client's own handle (self-import
+                        # raises cudaErrorDeviceUninitialized, crashing TP).
+                        self._event_bus.publish_on_stream(
+                            gpu_context.cupy_stream,
+                            Event(
+                                event_type=EventType.CB_RETRIEVE_END,
+                                session_id=key.request_id,
+                                metadata={"success": False},
+                            ),
+                        )
+                        self._event_bus.publish_on_stream(
+                            gpu_context.cupy_stream,
+                            Event(
+                                event_type=EventType.CB_REQUEST_END,
+                                session_id=key.request_id,
+                            ),
+                        )
                         event.record()
                         return event.ipc_handle(), False
 
@@ -2445,6 +2559,7 @@ class BlendV3Module(InstanceLivenessTarget):
                             },
                         ),
                     )
+                    scatter_open = True
 
                     # Consecutive matches → one batched scatter per group.
                     runs: list[list[tuple[CBMatchResult, Any]]] = []
@@ -2516,10 +2631,21 @@ class BlendV3Module(InstanceLivenessTarget):
                         Event(
                             event_type=EventType.CB_SCATTER_END,
                             session_id=key.request_id,
+                            metadata={"success": True},
                         ),
                     )
+                    scatter_open = False
             except Exception:
                 logger.exception("Error during retrieving prefetched results")
+                if scatter_open:
+                    self._event_bus.publish_on_stream(
+                        gpu_context.cupy_stream,
+                        Event(
+                            event_type=EventType.CB_SCATTER_END,
+                            session_id=key.request_id,
+                            metadata={"success": False},
+                        ),
+                    )
                 self._event_bus.publish_on_stream(
                     gpu_context.cupy_stream,
                     Event(
