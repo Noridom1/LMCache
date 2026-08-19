@@ -35,6 +35,7 @@ from lmcache.v1.mp_coordinator.config import MPCoordinatorConfig
 from lmcache.v1.mp_coordinator.controllers.eviction_controller import (
     FleetEvictionController,
 )
+from lmcache.v1.mp_coordinator.controllers.memory_usage import MemoryUsageTracker
 from lmcache.v1.mp_coordinator.controllers.prefetch_manager import PrefetchManager
 from lmcache.v1.mp_coordinator.controllers.usage_manager import CacheUsageManager
 from lmcache.v1.mp_coordinator.http_apis.dependencies import CoordinatorContext
@@ -43,6 +44,7 @@ from lmcache.v1.mp_coordinator.ingest.event_gate import EventGate
 from lmcache.v1.mp_coordinator.key_directory import KeyDirectory
 from lmcache.v1.mp_coordinator.persistence.quiesce import QuiesceLock
 from lmcache.v1.mp_coordinator.registry import InstanceRegistry
+from lmcache.v1.mp_coordinator.server_config import ServerConfigRegistry
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 from lmcache.v1.utils.router_discovery import discover_api_routers
 
@@ -93,6 +95,11 @@ def create_app(config: MPCoordinatorConfig) -> FastAPI:
         trigger_watermark=config.trigger_watermark,
     )
     prefetch_manager = PrefetchManager()
+    # Memory pressure's two halves: usage from the event stream, capacity
+    # declared at registration. Kept apart because they arrive on different
+    # channels at very different rates.
+    memory_usage = MemoryUsageTracker()
+    server_config = ServerConfigRegistry()
     # Resolves pin requests' token_ids to object keys; must match the fleet's
     # chunk size and hash algorithm (see MPCoordinatorConfig).
     token_hasher = TokenHasher(
@@ -106,6 +113,7 @@ def create_app(config: MPCoordinatorConfig) -> FastAPI:
     # usage view for the same batch, so the usage view must consume first.
     event_broadcaster.register_consumer(usage_manager)
     event_broadcaster.register_consumer(eviction_controller)
+    event_broadcaster.register_consumer(memory_usage)
     # Held by the ingest path; whoever captures durable state takes it
     # to read across the consumers consistently.
     quiesce = QuiesceLock()
@@ -119,6 +127,8 @@ def create_app(config: MPCoordinatorConfig) -> FastAPI:
         token_hasher=token_hasher,
         key_directory=key_directory,
         event_gate=event_gate,
+        memory_usage=memory_usage,
+        server_config=server_config,
     )
 
     async def _health_loop() -> None:
