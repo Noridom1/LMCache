@@ -14,6 +14,7 @@ import time
 from lmcache.lmcache_native import Bitmap, PeriodicEventNotifier
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import (
+    CapacitySnapshot,
     MemoryLayoutDesc,
     ModuleMemoryCapacity,
     ObjectKey,
@@ -87,6 +88,9 @@ class StorageManager:
         self._next_adapter_id = 0
         # Serializes add_l2_adapter / delete_l2_adapter against each other.
         self._lifecycle_lock = threading.Lock()
+        # Bumped whenever the capacity topology changes, so the
+        # coordinator can reject a declaration that arrived late.
+        self._capacity_revision = 0
         # Guards the _l2_adapters and _adapter_descriptors dicts.
         self._adapters_lock = threading.Lock()
         self._registered_l2_listeners: list[L2AdapterListener] = []
@@ -834,7 +838,7 @@ class StorageManager:
             out_by_type.setdefault(desc.type_name, []).append(usage)
         return out_by_type
 
-    def get_memory_capacities(self) -> list[ModuleMemoryCapacity]:
+    def get_memory_capacities(self) -> CapacitySnapshot:
         """Report every memory compartment's configured capacity.
 
         Sent to the coordinator at registration and joined there against
@@ -844,8 +848,20 @@ class StorageManager:
         raises is skipped rather than reported with a wrong capacity.
 
         Returns:
-            One entry per compartment. ``capacity_bytes == 0`` means the
-            adapter declares no limit.
+            The current revision and one entry per compartment.
+            ``capacity_bytes == 0`` means the adapter declares no limit.
+        """
+        with self._lifecycle_lock:
+            return CapacitySnapshot(
+                revision=self._capacity_revision,
+                modules=tuple(self._build_capacities()),
+            )
+
+    def _build_capacities(self) -> list[ModuleMemoryCapacity]:
+        """Assemble one capacity entry per memory compartment.
+
+        Returns:
+            L1 per backing medium, then one entry per L2 adapter.
         """
         capacities = [
             ModuleMemoryCapacity(
@@ -948,6 +964,26 @@ class StorageManager:
             if self._unwrap_reconfigurable_l2_adapter(adapter) is not None
         }
 
+    def _publish_capacity_changed(self) -> None:
+        """Bump the revision and announce the new topology.
+
+        Call with ``_lifecycle_lock`` held. The event carries the whole
+        declaration rather than a delta, so a dropped one is repaired by
+        the next instead of leaving the coordinator permanently wrong.
+        """
+        self._capacity_revision += 1
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.SM_CAPACITY_CHANGED,
+                metadata={
+                    "snapshot": CapacitySnapshot(
+                        revision=self._capacity_revision,
+                        modules=tuple(self._build_capacities()),
+                    )
+                },
+            )
+        )
+
     def reconfigure_l2_adapter(
         self,
         adapter_index: int,
@@ -967,6 +1003,8 @@ class StorageManager:
         adapter = self._get_reconfigurable_l2_adapter(adapter_index)
         result = adapter.reconfigure(operation, payload)
         result["adapter_index"] = adapter_index
+        with self._lifecycle_lock:
+            self._publish_capacity_changed()
         return result
 
     def add_l2_adapter(self, config: L2AdapterConfigBase) -> int:
@@ -997,6 +1035,7 @@ class StorageManager:
                     )
                 )
             logger.info("Added L2 adapter %d (%s)", adapter_id, descriptor.type_name)
+            self._publish_capacity_changed()
             return adapter_id
 
     def delete_l2_adapter(self, adapter_id: int, timeout: float = 30.0) -> None:
@@ -1039,6 +1078,7 @@ class StorageManager:
                 self._adapter_descriptors.pop(adapter_id, None)
             adapter.close()
             logger.info("Deleted L2 adapter %d", adapter_id)
+            self._publish_capacity_changed()
 
     def l2_adapters(self) -> list[tuple[AdapterDescriptor, L2AdapterInterface]]:
         """Return all active L2 adapters paired with descriptors, in

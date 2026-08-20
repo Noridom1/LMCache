@@ -22,7 +22,7 @@ import httpx
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.v1.distributed.api import L1BackendType, ObjectKey, Tier
+from lmcache.v1.distributed.api import CapacitySnapshot, L1BackendType, ObjectKey, Tier
 from lmcache.v1.distributed.internal_api import L1ObjectMeta
 from lmcache.v1.mp_coordinator.api import (
     UNKNOWN_TOKEN_OFFSET,
@@ -30,7 +30,11 @@ from lmcache.v1.mp_coordinator.api import (
     CacheEventEntry,
     CacheEventType,
 )
-from lmcache.v1.mp_coordinator.schemas import CacheEventsRequest
+from lmcache.v1.mp_coordinator.schemas import (
+    CacheEventsRequest,
+    ModuleCapacityModel,
+    ServerCapacityReport,
+)
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import EventCallback, EventSubscriber
 
@@ -56,11 +60,16 @@ class CacheEventSink(ABC):
     """
 
     @abstractmethod
-    def publish(self, batches: list[CacheEventBatch]) -> None:
+    def publish(
+        self,
+        batches: list[CacheEventBatch],
+        capacity_reports: list[ServerCapacityReport],
+    ) -> None:
         """Deliver ``batches`` to the directory, in list order.
 
         Args:
-            batches: The batches to deliver; never empty.
+            batches: The batches to deliver.
+            capacity_reports: Capacity declarations to apply, if any.
 
         Raises:
             CacheEventPublishError: If delivery failed. Retrying and
@@ -89,17 +98,22 @@ class HttpCacheEventSink(CacheEventSink):
         self._base_url = coordinator_url.rstrip("/")
         self._client = httpx.Client(timeout=timeout)
 
-    def publish(self, batches: list[CacheEventBatch]) -> None:
+    def publish(
+        self,
+        batches: list[CacheEventBatch],
+        capacity_reports: list[ServerCapacityReport],
+    ) -> None:
         """Deliver ``batches`` via one ``POST /events`` request.
 
         Args:
-            batches: The batches to deliver; never empty.
+            batches: The batches to deliver.
+            capacity_reports: Capacity declarations to apply, if any.
 
         Raises:
             CacheEventPublishError: If the request failed or returned
                 a non-2xx status.
         """
-        body = CacheEventsRequest(batches=batches)
+        body = CacheEventsRequest(batches=batches, capacity_reports=capacity_reports)
         try:
             resp = self._client.post(
                 f"{self._base_url}/events",
@@ -186,6 +200,9 @@ class CacheEventSubscriber(EventSubscriber):
         # Consecutive same-identity entries append to the last pending
         # batch; an identity change starts a new one (order-preserving).
         self._pending_batches: list[_PendingBatch] = []
+        # At most one pending report: each is a whole declaration, so a
+        # newer one supersedes rather than queues behind an older.
+        self._pending_capacity: ServerCapacityReport | None = None
         # Chunk hash → token content from token-binding events (published
         # ahead of the write-finished events), used to stamp STORE
         # entries. LRU-bounded; a miss stamps nothing.
@@ -202,6 +219,7 @@ class CacheEventSubscriber(EventSubscriber):
             EventType.L2_KEYS_DELETED: self._on_l2_delete,
             EventType.L2_KEYS_ACCESSED: self._on_l2_access,
             EventType.MP_TOKENS: self._on_tokens,
+            EventType.SM_CAPACITY_CHANGED: self._on_capacity_changed,
             # TODO: decouple the flush tick from the eviction loop (e.g. a
             # bus-owned periodic hook) so cache-event freshness does not
             # silently depend on the eviction loop's cadence.
@@ -213,10 +231,12 @@ class CacheEventSubscriber(EventSubscriber):
 
         Publish failures are logged and the drained list is dropped.
         """
-        if not self._pending_batches:
+        if not self._pending_batches and self._pending_capacity is None:
             return
         pending_batches = self._pending_batches
         self._pending_batches = []
+        capacity = self._pending_capacity
+        self._pending_capacity = None
         ts = time.time()
         batches = [
             CacheEventBatch(
@@ -233,9 +253,15 @@ class CacheEventSubscriber(EventSubscriber):
             for offset, pending in enumerate(pending_batches)
         ]
         self._seq += len(pending_batches)
+        reports = [capacity] if capacity is not None else []
         try:
-            self._sink.publish(batches)
+            self._sink.publish(batches, reports)
         except CacheEventPublishError as e:
+            # The batches are lost for good; the capacity report is not --
+            # it is a whole declaration, so restoring it lets the next flush
+            # resend it. A newer one arriving first simply supersedes it.
+            if capacity is not None and self._pending_capacity is None:
+                self._pending_capacity = capacity
             logger.warning(
                 "Dropping %d cache-event batches (instance %s): %s",
                 len(batches),
@@ -250,6 +276,24 @@ class CacheEventSubscriber(EventSubscriber):
         self._sink.close()
 
     # -- Event handlers (bus drain thread) ------------------------------------
+
+    def _on_capacity_changed(self, event: Event) -> None:
+        """Hold the new declaration for the next flush."""
+        snapshot: CapacitySnapshot = event.metadata["snapshot"]
+        self._pending_capacity = ServerCapacityReport(
+            instance_id=self._instance_id,
+            revision=snapshot.revision,
+            modules=[
+                ModuleCapacityModel(
+                    tier=module.tier,
+                    backend=module.backend,
+                    capacity_bytes=module.capacity_bytes,
+                    shared=module.shared,
+                )
+                for module in snapshot.modules
+            ],
+        )
+        self._flush_if_due()
 
     def _on_tick(self, event: Event) -> None:
         self._flush_if_due()

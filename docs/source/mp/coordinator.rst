@@ -1155,10 +1155,11 @@ medium, or one L2 adapter. It is identified by ``(tier, backend)`` -- the same
 pair cache events tag placements with.
 
 Two inputs are joined. **Usage** is derived from the cache-event stream the
-servers already publish. **Capacity** is what each server declares in
-``memory_modules`` when it registers, since a capacity changes at boot and at
-reconfiguration rather than per request. Both are automatic; there is nothing
-to configure beyond pointing servers at a coordinator.
+servers already publish. **Capacity** is declared by each server: in
+``memory_modules`` at registration, and thereafter as a capacity report on
+the event stream whenever an adapter is added, removed, or reconfigured. Both
+are automatic; there is nothing to configure beyond pointing servers at a
+coordinator.
 
 These endpoints are read-only. The coordinator never evicts or throttles based
 on them.

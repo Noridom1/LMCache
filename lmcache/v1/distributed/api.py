@@ -274,6 +274,24 @@ class ModuleMemoryCapacity:
 
 
 @dataclass(frozen=True)
+class CapacitySnapshot:
+    """This server's memory capacities and the revision they were taken at.
+
+    Read atomically so a reader cannot pair a revision with a different
+    topology's modules.
+
+    Attributes:
+        revision: Monotonic per-process counter, bumped on every capacity
+            change. Restarts at 0, so it orders declarations only within one
+            process incarnation.
+        modules: One entry per memory compartment.
+    """
+
+    revision: int
+    modules: tuple["ModuleMemoryCapacity", ...]
+
+
+@dataclass(frozen=True)
 class KeyEntry:
     """One entry in a :class:`KeyListPage` including the encoded object
     key and its object size."""

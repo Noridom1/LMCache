@@ -31,6 +31,7 @@ from lmcache.v1.mp_coordinator.cache_events import (
     HttpCacheEventSink,
 )
 from lmcache.v1.mp_coordinator.config import MPCoordinatorConfig
+from lmcache.v1.mp_coordinator.schemas import ServerCapacityReport
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import EventBus, EventBusConfig
 import lmcache.v1.mp_coordinator.cache_events as cache_events
@@ -57,14 +58,20 @@ class _RecordingSink(CacheEventSink):
 
     def __init__(self) -> None:
         self.published: list[list[CacheEventBatch]] = []
+        self.published_capacity: list[list[ServerCapacityReport]] = []
         self.fail_next = False
         self.closed = False
 
-    def publish(self, batches: list[CacheEventBatch]) -> None:
+    def publish(
+        self,
+        batches: list[CacheEventBatch],
+        capacity_reports: list[ServerCapacityReport],
+    ) -> None:
         if self.fail_next:
             self.fail_next = False
             raise CacheEventPublishError("injected failure")
         self.published.append(batches)
+        self.published_capacity.append(capacity_reports)
 
     def close(self) -> None:
         self.closed = True
@@ -807,5 +814,5 @@ def test_http_sink_raises_publish_error_on_http_failure():
         entries=[_entry(1, 100)],
     )
     with pytest.raises(CacheEventPublishError):
-        sink.publish([batch])
+        sink.publish([batch], [])
     sink.close()

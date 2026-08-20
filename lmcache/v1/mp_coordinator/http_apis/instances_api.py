@@ -60,6 +60,7 @@ async def register_instance(
             )
             for module in body.memory_modules
         ],
+        body.capacity_revision,
     )
     # Wall-clock registration_time for display; monotonic last_heartbeat_time for
     # NTP-safe stale detection (see registry.stale). register() does the

@@ -66,22 +66,73 @@ class ModuleCapacity:
 class ServerConfigRegistry:
     """Thread-safe store of each MP server's declared module capacities.
 
-    :meth:`declare` replaces a server's declaration wholesale, so a dropped
-    L2 adapter's capacity does not linger.
+    Both writers replace a server's declaration wholesale, so a dropped L2
+    adapter's capacity does not linger. :meth:`declare` is authoritative
+    (registration); :meth:`update` is revision-guarded (capacity events).
     """
 
     def __init__(self) -> None:
         """Initialize an empty registry."""
         self._lock = threading.Lock()
         self._by_instance: dict[str, tuple[ModuleCapacity, ...]] = {}
+        self._revisions: dict[str, int] = {}
 
-    def declare(self, instance_id: str, modules: Sequence[ModuleCapacity]) -> None:
-        """Record ``instance_id``'s module capacities, replacing any prior set.
+    def declare(
+        self, instance_id: str, modules: Sequence[ModuleCapacity], revision: int = 0
+    ) -> None:
+        """Record ``instance_id``'s capacities from a registration.
+
+        Authoritative: it overwrites whatever revision was stored, because a
+        registration means a (re)started process whose counter may have gone
+        backwards.
 
         Args:
             instance_id: The declaring server's id. Non-empty.
             modules: Its compartments. Empty records that the server declared
                 nothing, which reads back as unknown capacity, not zero.
+            revision: The revision ``modules`` was taken at.
+
+        Raises:
+            ValueError: If ``instance_id`` is empty, or two entries share a
+                ``(tier, backend)`` identity.
+        """
+        self._validate(instance_id, modules)
+        with self._lock:
+            self._by_instance[instance_id] = tuple(modules)
+            self._revisions[instance_id] = revision
+
+    def update(
+        self, instance_id: str, modules: Sequence[ModuleCapacity], revision: int
+    ) -> bool:
+        """Apply a capacity report, unless it is older than what is stored.
+
+        Args:
+            instance_id: The declaring server's id. Non-empty.
+            modules: Its current compartments, replacing any prior set.
+            revision: The revision ``modules`` was taken at.
+
+        Returns:
+            ``True`` when applied, ``False`` when the report was superseded.
+
+        Raises:
+            ValueError: If ``instance_id`` is empty, or two entries share a
+                ``(tier, backend)`` identity.
+        """
+        self._validate(instance_id, modules)
+        with self._lock:
+            if revision <= self._revisions.get(instance_id, -1):
+                return False
+            self._by_instance[instance_id] = tuple(modules)
+            self._revisions[instance_id] = revision
+            return True
+
+    @staticmethod
+    def _validate(instance_id: str, modules: Sequence[ModuleCapacity]) -> None:
+        """Reject an empty id or two entries for one compartment.
+
+        Args:
+            instance_id: The declaring server's id.
+            modules: The compartments being declared.
 
         Raises:
             ValueError: If ``instance_id`` is empty, or two entries share a
@@ -98,8 +149,6 @@ class ServerConfigRegistry:
                     f"{module.tier.value}/{module.backend}"
                 )
             seen.add(identity)
-        with self._lock:
-            self._by_instance[instance_id] = tuple(modules)
 
     def get(self, instance_id: str) -> tuple[ModuleCapacity, ...]:
         """Return ``instance_id``'s declared compartments.
@@ -131,3 +180,4 @@ class ServerConfigRegistry:
         """
         with self._lock:
             self._by_instance.pop(instance_id, None)
+            self._revisions.pop(instance_id, None)

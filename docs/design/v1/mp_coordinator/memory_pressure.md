@@ -23,13 +23,41 @@ admitted cache-event stream up per `(instance_id, backend)` for both tiers —
 `get_bytes_by_instance(tier)` — which is exactly the axis a pressure reading
 needs. This capability adds only the denominator.
 
-## Why capacity does not ride the event stream
+## How capacity reaches the coordinator
 
-Capacity is configuration. It changes when a server boots and when it is
-reconfigured — not once per cache event. Putting it on a per-event channel
-would republish an unchanging number thousands of times a second; putting it
-on registration republishes it exactly when it can change, because a
-reconfigured server re-registers.
+Two writers, both replacing a server's declaration wholesale:
+
+- **`POST /instances`** — the baseline, sent at registration. Authoritative:
+  it resets the stored revision, because a restarted process's counter goes
+  back to zero.
+- **`capacity_reports` on `POST /events`** — updates, emitted when the
+  topology changes (adapter added, removed, or reconfigured; a Device-DAX
+  device mapped). `StorageManager` publishes `SM_CAPACITY_CHANGED` on the
+  observability bus; the cache-event subscriber ships it on its next flush.
+
+A report carries the **whole declaration**, never a delta. That is what makes
+the lossy event channel acceptable here: a dropped report is repaired by the
+next one, where a dropped byte delta would be permanent. The emitter also
+keeps an unsent report across a publish failure, so a transient outage does
+not lose it.
+
+Each report carries a monotonic per-process `revision`, and the registry
+ignores one it has already passed — otherwise two reconfigures racing could
+let an older full declaration overwrite a newer topology.
+
+Capacity does not ride the batch envelope itself: `CacheEventBatch` requires
+a non-empty `backend`, rejects `Tier.ALL`, and every entry needs an
+`ObjectKey`. A declaration has no key, so it travels as a sibling field on
+the same request — sharing the connection and flush tick without contorting
+the entry shape.
+
+## Why capacity is not a cache event
+
+Capacity is configuration: it changes when a server boots and when it is
+reconfigured, not once per cache operation. Emitting it per operation would
+republish an unchanging number thousands of times a second, and it would
+carry no `ObjectKey` for the gate's dedup and fencing to work on. Emitting it
+on change keeps the volume proportional to what actually varies.
 
 ## Architecture
 

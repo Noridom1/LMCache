@@ -327,3 +327,105 @@ class TestRegistration:
                     ],
                 },
             )
+
+
+class TestCapacityReports:
+    """Capacity updates arriving on the event stream, not at registration."""
+
+    def _report(
+        self, instance_id: str, revision: int, capacity_bytes: int
+    ) -> dict[str, object]:
+        """Build one capacity-report body."""
+        return {
+            "instance_id": instance_id,
+            "revision": revision,
+            "modules": [
+                {"tier": "l1", "backend": "dram", "capacity_bytes": capacity_bytes}
+            ],
+        }
+
+    def _post(self, client: TestClient, *reports: dict[str, object]) -> None:
+        """Send capacity reports through ``POST /events``."""
+        response = client.post(
+            "/events", json={"batches": [], "capacity_reports": list(reports)}
+        )
+        assert response.status_code == 200, response.text
+
+    def _capacity(self, client: TestClient, instance_id: str) -> int:
+        """Read back one instance's declared L1 capacity."""
+        body = client.get(f"/memory/{instance_id}").json()
+        return _module(body, "l1", "dram")["capacity_bytes"]
+
+    def test_report_updates_capacity_without_re_registration(
+        self, client: TestClient
+    ) -> None:
+        _register(
+            client,
+            "mp-1",
+            [{"tier": "l1", "backend": "dram", "capacity_bytes": 40 * GIB}],
+        )
+        _ingest(client, "mp-1", Tier.L1, "dram", 10 * GIB, index=1)
+        assert _module(client.get("/memory/mp-1").json(), "l1", "dram")[
+            "usage_ratio"
+        ] == pytest.approx(0.25)
+
+        # A device was added at runtime: same server, bigger pool.
+        self._post(client, self._report("mp-1", 1, 80 * GIB))
+        assert _module(client.get("/memory/mp-1").json(), "l1", "dram")[
+            "usage_ratio"
+        ] == pytest.approx(0.125)
+
+    def test_stale_report_cannot_regress_the_topology(self, client: TestClient) -> None:
+        # Reports are whole declarations, so an out-of-order one would
+        # otherwise overwrite a newer topology.
+        _register(client, "mp-1", [])
+        self._post(client, self._report("mp-1", 5, 80 * GIB))
+        self._post(client, self._report("mp-1", 3, 10 * GIB))
+        assert self._capacity(client, "mp-1") == 80 * GIB
+
+    def test_same_revision_is_ignored(self, client: TestClient) -> None:
+        _register(client, "mp-1", [])
+        self._post(client, self._report("mp-1", 2, 80 * GIB))
+        self._post(client, self._report("mp-1", 2, 10 * GIB))
+        assert self._capacity(client, "mp-1") == 80 * GIB
+
+    def test_registration_overrides_a_higher_revision(self, client: TestClient) -> None:
+        # A restarted server's counter goes back to 0; registration is
+        # authoritative or its declarations would be rejected forever.
+        _register(client, "mp-1", [])
+        self._post(client, self._report("mp-1", 9, 80 * GIB))
+        _register(
+            client,
+            "mp-1",
+            [{"tier": "l1", "backend": "dram", "capacity_bytes": 16 * GIB}],
+        )
+        assert self._capacity(client, "mp-1") == 16 * GIB
+        # And a post-restart report at a low revision still applies.
+        self._post(client, self._report("mp-1", 1, 32 * GIB))
+        assert self._capacity(client, "mp-1") == 32 * GIB
+
+    def test_report_replaces_wholesale_so_dropped_modules_vanish(
+        self, client: TestClient
+    ) -> None:
+        _register(
+            client,
+            "mp-1",
+            [
+                {"tier": "l1", "backend": "dram", "capacity_bytes": 40 * GIB},
+                {"tier": "l2", "backend": "fs", "capacity_bytes": 90 * GIB},
+            ],
+        )
+        self._post(client, self._report("mp-1", 1, 40 * GIB))
+        backends = {
+            (m["tier"], m["backend"])
+            for m in client.get("/memory/mp-1").json()["modules"]
+        }
+        assert backends == {("l1", "dram")}
+
+    def test_events_and_reports_ride_the_same_request(self, client: TestClient) -> None:
+        _register(client, "mp-1", [])
+        _ingest(client, "mp-1", Tier.L1, "dram", 20 * GIB, index=1)
+        self._post(client, self._report("mp-1", 1, 40 * GIB))
+        module = _module(client.get("/memory/mp-1").json(), "l1", "dram")
+        assert module["used_bytes"] == 20 * GIB
+        assert module["usage_ratio"] == pytest.approx(0.5)

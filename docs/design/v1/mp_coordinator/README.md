@@ -222,10 +222,11 @@ state that the cache-control endpoints write, not the reverse.
 `GET /memory` answers how full each server's memory compartments are, by
 joining two halves that arrive on different channels at very different
 rates: **usage** from `CacheUsageManager.get_bytes_by_instance`, already
-maintained off the admitted cache-event stream, and **capacity** declared in
-`POST /instances`. Capacity is configuration — it changes at boot and at
-reconfiguration, not per event — so it rides registration, and a
-reconfigured server republishes by re-registering.
+maintained off the admitted cache-event stream, and **capacity** declared by
+the server. Capacity is configuration — it changes at boot and at
+reconfiguration, not per event — so registration carries the baseline and
+`capacity_reports` on `POST /events` carry changes, each a whole declaration
+guarded by a monotonic revision.
 
 The endpoint adds no usage tracking of its own: the per-instance,
 per-backend rollup it needs is exactly what the usage manager publishes.

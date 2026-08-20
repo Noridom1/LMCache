@@ -13,7 +13,7 @@ logged and retried, and it never takes the MP server down.
 """
 
 # Standard
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 import asyncio
 import contextlib
 
@@ -23,7 +23,7 @@ import httpx
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.v1.distributed.api import ModuleMemoryCapacity
+from lmcache.v1.distributed.api import CapacitySnapshot
 from lmcache.v1.mp_coordinator.schemas import (
     ModuleCapacityModel,
     RegisterRequest,
@@ -36,9 +36,13 @@ logger = init_logger(__name__)
 _DEFAULT_HEARTBEAT_INTERVAL = 5.0
 
 
-def _no_memory_capacities() -> Sequence[ModuleMemoryCapacity]:
-    """Declare no memory capacity. Default for callers that report none."""
-    return ()
+# Declares nothing; the default for callers that report no capacity.
+_NO_CAPACITIES = CapacitySnapshot(revision=0, modules=())
+
+
+def _no_memory_capacities() -> CapacitySnapshot:
+    """Return the empty declaration. Default probe for callers with none."""
+    return _NO_CAPACITIES
 
 
 async def register(
@@ -50,7 +54,7 @@ async def register(
     instance_id: str = "",
     p2p_advertised_url: str = "",
     mq_port: int = 0,
-    memory_capacities: Sequence[ModuleMemoryCapacity] = (),
+    memory_capacities: CapacitySnapshot = _NO_CAPACITIES,
 ) -> str:
     """Register an MP server with the coordinator and return its id.
 
@@ -64,9 +68,9 @@ async def register(
             when P2P is disabled.
         mq_port: Port of this server's ZMQ message-queue server for P2P lookup
             RPCs. 0 when P2P is disabled.
-        memory_capacities: This server's per-compartment memory capacities.
-            Empty declares nothing, and usage is then reported without a
-            pressure ratio.
+        memory_capacities: This server's capacities and the revision they
+            were taken at. Empty declares nothing, and usage is then
+            reported without a pressure ratio.
 
     Returns:
         The registered instance id (coordinator-assigned if ``instance_id`` was
@@ -88,8 +92,9 @@ async def register(
                 capacity_bytes=capacity.capacity_bytes,
                 shared=capacity.shared,
             )
-            for capacity in memory_capacities
+            for capacity in memory_capacities.modules
         ],
+        capacity_revision=memory_capacities.revision,
     )
     response = await client.post(
         f"{base_url}/instances", json=body.model_dump(mode="json")
@@ -108,9 +113,7 @@ async def keep_registered(
     heartbeat_interval: float = _DEFAULT_HEARTBEAT_INTERVAL,
     p2p_advertised_url: str = "",
     mq_port: int = 0,
-    memory_capacities: Callable[[], Sequence[ModuleMemoryCapacity]] = (
-        _no_memory_capacities
-    ),
+    memory_capacities: Callable[[], CapacitySnapshot] = _no_memory_capacities,
 ) -> None:
     """Register, heartbeat on a timer, and deregister on cancellation.
 
@@ -134,10 +137,10 @@ async def keep_registered(
             when P2P is disabled.
         mq_port: Port of this server's ZMQ message-queue server for P2P lookup
             RPCs. 0 when P2P is disabled.
-        memory_capacities: Probe returning this server's per-compartment
-            memory capacities. Called once per registration, not captured up
-            front, so a re-registration reflects runtime reconfiguration.
-            Returning an empty sequence declares nothing.
+        memory_capacities: Probe returning this server's capacities. Called
+            once per registration, so a re-registration reflects runtime
+            reconfiguration; changes between registrations reach the
+            coordinator as capacity reports on the event stream.
     """
     base_url = coordinator_url.rstrip("/")
     ip = advertise_ip or get_ip()

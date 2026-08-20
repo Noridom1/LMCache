@@ -115,6 +115,26 @@ class ModuleCapacityModel(BaseModel):
         return value
 
 
+class ServerCapacityReport(BaseModel):
+    """One server's full capacity declaration, sent when its topology changes.
+
+    A whole declaration, never a delta: a dropped report is repaired by the
+    next one instead of leaving the coordinator permanently wrong.
+
+    Attributes:
+        instance_id: The declaring server. Non-empty.
+        revision: Monotonic per-process counter. The coordinator ignores a
+            report whose revision it has already passed, so reports that
+            arrive out of order cannot regress the topology. Resets when the
+            server restarts, which is why a registration overrides it.
+        modules: The server's current compartments, replacing any prior set.
+    """
+
+    instance_id: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+    revision: int = Field(ge=0)
+    modules: list[ModuleCapacityModel] = Field(default_factory=list)
+
+
 class RegisterRequest(BaseModel):
     """Body of a ``POST /instances`` registration request.
 
@@ -136,6 +156,10 @@ class RegisterRequest(BaseModel):
             per L2 adapter). Empty means nothing was declared, and usage is
             then reported without a pressure ratio. A re-registration replaces
             the previous declaration wholesale.
+        capacity_revision: The revision ``memory_modules`` was taken at.
+            Registration is authoritative and resets the coordinator's stored
+            revision, so a restarted server whose counter went backwards is
+            still accepted.
     """
 
     instance_id: Annotated[str, StringConstraints(strip_whitespace=True)] = ""
@@ -145,6 +169,7 @@ class RegisterRequest(BaseModel):
     p2p_advertised_url: Annotated[str, StringConstraints(strip_whitespace=True)] = ""
     mq_port: int = Field(default=0, ge=0, le=65535)
     memory_modules: list[ModuleCapacityModel] = Field(default_factory=list)
+    capacity_revision: int = Field(default=0, ge=0)
 
 
 class RegisterResponse(BaseModel):
@@ -332,9 +357,14 @@ class CacheEventsRequest(BaseModel):
 
     Attributes:
         batches: Event batches to apply, in emission order per instance.
+        capacity_reports: Capacity declarations changed since the last
+            request. Carried alongside the batches rather than inside one:
+            a declaration has no object key, so it does not fit the batch
+            envelope.
     """
 
     batches: list[CacheEventBatch] = Field(default_factory=list)
+    capacity_reports: list[ServerCapacityReport] = Field(default_factory=list)
 
     @field_validator("batches")
     @classmethod

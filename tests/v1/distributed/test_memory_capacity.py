@@ -23,6 +23,7 @@ from lmcache.v1.distributed.config import (
 from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.memory_manager.l1_manager_protocol import L1ManagerProtocol
 from lmcache.v1.distributed.storage_manager import StorageManager
+from lmcache.v1.mp_observability.event import Event, EventType
 
 GIB = 1 << 30
 
@@ -72,6 +73,16 @@ class _FakeL1Manager:
         return self._capacities
 
 
+class _RecordingBus:
+    """Captures what the publish path emits."""
+
+    def __init__(self) -> None:
+        self.events: list[Event] = []
+
+    def publish(self, event: Event) -> None:
+        self.events.append(event)
+
+
 class _StorageManagerStub:
     """Stands in for a ``StorageManager``, minus its pinned-memory ``__init__``."""
 
@@ -82,6 +93,12 @@ class _StorageManagerStub:
     ) -> None:
         self._l1_manager = _FakeL1Manager(l1)
         self._adapters = adapters
+        self._lifecycle_lock = threading.Lock()
+        self._capacity_revision = 0
+        self._event_bus = _RecordingBus()
+
+    def _build_capacities(self) -> list[ModuleMemoryCapacity]:
+        return StorageManager._build_capacities(cast("StorageManager", self))
 
     def _snapshot_adapters(
         self,
@@ -106,7 +123,9 @@ def _capacities(
         The capacities the method assembles.
     """
     stub = _StorageManagerStub(l1, adapters)
-    return StorageManager.get_memory_capacities(cast("StorageManager", stub))
+    return list(
+        StorageManager.get_memory_capacities(cast("StorageManager", stub)).modules
+    )
 
 
 def _config_yielding(capacities: dict[L1BackendType, int]) -> L1ManagerConfig:
@@ -356,3 +375,47 @@ class TestReportStatusSharesTheSource:
     def test_unconfigured_tier_reports_zero_not_the_heap(self) -> None:
         manager = self._l1_manager({})
         assert manager.report_status()["memory_configured_bytes"] == 0
+
+
+class TestCapacityChangePublishing:
+    """Runtime reconfiguration announces the new topology on the bus.
+
+    Without this, a coordinator declaration made at registration keeps the
+    boot capacity for the life of the process.
+    """
+
+    def _stub(self) -> _StorageManagerStub:
+        """A stub wired with the bus plumbing the publish path needs."""
+        return _StorageManagerStub({L1BackendType.DRAM: 40 * GIB}, [])
+
+    def test_publish_bumps_the_revision(self) -> None:
+        stub = self._stub()
+        StorageManager._publish_capacity_changed(cast("StorageManager", stub))
+        StorageManager._publish_capacity_changed(cast("StorageManager", stub))
+        assert [e.metadata["snapshot"].revision for e in stub._event_bus.events] == [
+            1,
+            2,
+        ]
+
+    def test_published_event_carries_the_whole_declaration(self) -> None:
+        # A delta would leave the coordinator permanently wrong if dropped.
+        stub = self._stub()
+        StorageManager._publish_capacity_changed(cast("StorageManager", stub))
+        snapshot = stub._event_bus.events[0].metadata["snapshot"]
+        assert [(m.tier, m.backend, m.capacity_bytes) for m in snapshot.modules] == [
+            (Tier.L1, "dram", 40 * GIB)
+        ]
+
+    def test_event_type_is_the_capacity_one(self) -> None:
+        stub = self._stub()
+        StorageManager._publish_capacity_changed(cast("StorageManager", stub))
+        assert stub._event_bus.events[0].event_type == EventType.SM_CAPACITY_CHANGED
+
+    def test_snapshot_pairs_the_revision_with_its_own_modules(self) -> None:
+        # Read under one lock, so a reader cannot pair a revision with a
+        # later topology.
+        stub = self._stub()
+        StorageManager._publish_capacity_changed(cast("StorageManager", stub))
+        snapshot = StorageManager.get_memory_capacities(cast("StorageManager", stub))
+        assert snapshot.revision == 1
+        assert len(snapshot.modules) == 1
