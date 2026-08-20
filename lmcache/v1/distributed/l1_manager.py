@@ -205,6 +205,11 @@ class L1Manager:
 
         # Retained so configured capacity comes from one source.
         self._config = config
+        # Precomputed: it derives from config alone and never changes, and
+        # report_status runs under the global L1 lock on a hot polling path.
+        self._configured_capacity_bytes = sum(
+            configured_l1_capacity_bytes(config).values()
+        )
         self._write_ttl_seconds = config.write_ttl_seconds
         self._read_ttl_seconds = config.read_ttl_seconds
 
@@ -883,7 +888,6 @@ class L1Manager:
         # ``memory_total_bytes`` is what the allocator currently backs (the
         # grown heap on the lazy tier); this is the declared size. Summed to
         # match this dict's flat shape; ``0`` means undeclared.
-        configured = sum(self.get_configured_capacity_bytes().values())
         return {
             "is_healthy": self._memory_manager.memcheck(),
             "total_object_count": len(self._objects),
@@ -892,7 +896,7 @@ class L1Manager:
             "temporary_count": temporary,
             "memory_used_bytes": used,
             "memory_total_bytes": total,
-            "memory_configured_bytes": configured,
+            "memory_configured_bytes": self._configured_capacity_bytes,
             "memory_usage_ratio": used / total if total > 0 else 0.0,
             "write_ttl_seconds": self._write_ttl_seconds,
             "read_ttl_seconds": self._read_ttl_seconds,

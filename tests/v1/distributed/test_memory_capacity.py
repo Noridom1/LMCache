@@ -345,6 +345,8 @@ class TestReportStatusSharesTheSource:
         manager._memory_manager = cast("L1ManagerProtocol", _MemoryManager())
         # Capacity derives from config, so it must yield exactly `configured`.
         manager._config = _config_yielding(configured)
+        # report_status reads the precomputed total, not the live config.
+        manager._configured_capacity_bytes = sum(configured.values())
         manager._objects = {}
         manager._write_ttl_seconds = 600
         manager._read_ttl_seconds = 600
