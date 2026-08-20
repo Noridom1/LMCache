@@ -29,6 +29,7 @@ from lmcache.v1.distributed.config import (
 )
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import L2AdapterListener
+from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.l2_adapters.base import AdapterUsage, L2AdapterInterface
 from lmcache.v1.distributed.l2_adapters.config import (
     L2AdaptersConfig,
@@ -43,12 +44,14 @@ from lmcache.v1.distributed.l2_adapters.reconfiguration import (
     L2ReconfigurableAdapter,
     L2ReconfigureError,
 )
+from lmcache.v1.distributed.storage_controllers.store_policy import AdapterDescriptor
 from lmcache.v1.distributed.storage_manager import StorageManager
 from lmcache.v1.memory_allocators.ad_hoc_memory_allocator import AdHocMemoryAllocator
 from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObj,
 )
+from lmcache.v1.mp_observability.event_bus import EventBus
 from lmcache.v1.platform import consume_fd
 
 _EMPTY_LAYOUT = MemoryLayoutDesc(shapes=[], dtypes=[])
@@ -470,14 +473,22 @@ class _NoCapacityL1Manager:
 
 
 def _wire_capacity_publishing(sm: StorageManager) -> None:
-    """Give a bare StorageManager the state its capacity publish needs."""
+    """Give a bare StorageManager the state its capacity publish needs.
+
+    Reconfiguring an adapter also announces the new topology, which reads
+    the L1 manager, the adapter descriptors, and the event bus.
+
+    Args:
+        sm: The partially-constructed storage manager to wire up.
+    """
     sm._lifecycle_lock = threading.Lock()
     sm._capacity_revision = 0
-    sm._event_bus = cast("object", _RecordingBus())
-    sm._l1_manager = cast("object", _NoCapacityL1Manager())
+    sm._event_bus = cast(EventBus, _RecordingBus())
+    sm._l1_manager = cast(L1Manager, _NoCapacityL1Manager())
     if not hasattr(sm, "_adapter_descriptors"):
         sm._adapter_descriptors = {
-            adapter_id: _FakeAdapterDescriptor("fake") for adapter_id in sm._l2_adapters
+            adapter_id: cast(AdapterDescriptor, _FakeAdapterDescriptor("fake"))
+            for adapter_id in sm._l2_adapters
         }
 
 
