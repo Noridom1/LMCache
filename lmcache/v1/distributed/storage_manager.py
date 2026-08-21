@@ -25,7 +25,11 @@ from lmcache.v1.distributed.api import (
     TrimPolicy,
 )
 from lmcache.v1.distributed.bitmap_ops import fold_unfold_ranked
-from lmcache.v1.distributed.config import EvictionConfig, StorageManagerConfig
+from lmcache.v1.distributed.config import (
+    EvictionConfig,
+    StorageManagerConfig,
+    configured_l1_capacity_bytes,
+)
 from lmcache.v1.distributed.error import L1Error, strerror
 from lmcache.v1.distributed.internal_api import L1MemoryDesc, L2AdapterListener
 from lmcache.v1.distributed.l1_manager import L1Manager
@@ -71,6 +75,9 @@ logger = init_logger(__name__)
 class StorageManager:
     def __init__(self, config: StorageManagerConfig):
         self._l1_manager = L1Manager(config.l1_manager_config)
+        # Retained for the L1 half of the capacity report; L1's configured
+        # size is a pure function of it.
+        self._l1_config = config.l1_manager_config
         self._event_bus = get_event_bus()
 
         # L1 eviction controller
@@ -870,9 +877,9 @@ class StorageManager:
                 capacity_bytes=configured,
                 shared=False,
             )
-            for backend, configured in (
-                self._l1_manager.get_configured_capacity_bytes().items()
-            )
+            for backend, configured in configured_l1_capacity_bytes(
+                self._l1_config
+            ).items()
         ]
         for _adapter_id, desc, adapter in self._snapshot_adapters():
             try:

@@ -65,7 +65,7 @@ on change keeps the volume proportional to what actually varies.
 MP server                                   Coordinator
 ─────────                                   ───────────
 StorageManager.get_memory_capacities()
-  L1: get_configured_capacity_bytes()
+  L1: configured_l1_capacity_bytes(l1_config)
       → one entry per backing medium
   L2: per adapter, total_capacity_bytes
       + shared flag from its config
@@ -108,14 +108,14 @@ total would leave two compartments of usage sharing one denominator.
 
 ## Capacity is the configured size, not the live heap
 
-`get_configured_capacity_bytes()` exists rather than reusing
+`configured_l1_capacity_bytes()` is the denominator rather than
 `get_memory_usage()[1]`. On the default lazy allocator that total is the
 **currently grown heap**: it starts small and grows on demand, so a freshly
 booted server would report itself nearly full and then appear to drain as the
 pool warms. The configured size is stable from boot and is the only sound
 denominator.
 
-| Manager | `get_memory_usage()[1]` | `get_configured_capacity_bytes()` |
+| Manager | `get_memory_usage()[1]` | `configured_l1_capacity_bytes()` |
 | --- | --- | --- |
 | `L1MemoryManager` (default, lazy) | grown heap | `{dram: size_in_bytes}` |
 | `GDSL1MemoryManager` | configured slab | `{gds: size_in_bytes}` |

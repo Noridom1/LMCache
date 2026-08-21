@@ -29,7 +29,6 @@ from lmcache.v1.distributed.config import (
 )
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import L2AdapterListener
-from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.l2_adapters.base import AdapterUsage, L2AdapterInterface
 from lmcache.v1.distributed.l2_adapters.config import (
     L2AdaptersConfig,
@@ -465,18 +464,11 @@ class _RecordingBus:
         self.events.append(event)
 
 
-class _NoCapacityL1Manager:
-    """An L1 manager that declares nothing."""
-
-    def get_configured_capacity_bytes(self) -> dict:
-        return {}
-
-
 def _wire_capacity_publishing(sm: StorageManager) -> None:
     """Give a bare StorageManager the state its capacity publish needs.
 
     Reconfiguring an adapter also announces the new topology, which reads
-    the L1 manager, the adapter descriptors, and the event bus.
+    the L1 config, the adapter descriptors, and the event bus.
 
     Args:
         sm: The partially-constructed storage manager to wire up.
@@ -484,7 +476,10 @@ def _wire_capacity_publishing(sm: StorageManager) -> None:
     sm._lifecycle_lock = threading.Lock()
     sm._capacity_revision = 0
     sm._event_bus = cast(EventBus, _RecordingBus())
-    sm._l1_manager = cast(L1Manager, _NoCapacityL1Manager())
+    # Declares no L1, keeping these tests about the L2 path.
+    sm._l1_config = L1ManagerConfig(
+        memory_config=L1MemoryManagerConfig(size_in_bytes=0, use_lazy=True)
+    )
     if not hasattr(sm, "_adapter_descriptors"):
         sm._adapter_descriptors = {
             adapter_id: cast(AdapterDescriptor, _FakeAdapterDescriptor("fake"))

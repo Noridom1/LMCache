@@ -63,16 +63,6 @@ class _FakeAdapter:
         return _FakeUsage(self._capacity_bytes)
 
 
-class _FakeL1Manager:
-    """An L1 manager reporting a fixed per-medium capacity."""
-
-    def __init__(self, capacities: dict[L1BackendType, int]) -> None:
-        self._capacities = capacities
-
-    def get_configured_capacity_bytes(self) -> dict[L1BackendType, int]:
-        return self._capacities
-
-
 class _RecordingBus:
     """Captures what the publish path emits."""
 
@@ -91,7 +81,8 @@ class _StorageManagerStub:
         l1: dict[L1BackendType, int],
         adapters: list[tuple[_FakeDescriptor, _FakeAdapter]],
     ) -> None:
-        self._l1_manager = _FakeL1Manager(l1)
+        # A real config, so the stub exercises the actual L1 derivation.
+        self._l1_config = _config_yielding(l1)
         self._adapters = adapters
         self._lifecycle_lock = threading.Lock()
         self._capacity_revision = 0
@@ -335,18 +326,15 @@ class TestReportStatusSharesTheSource:
                 # The grown heap, deliberately unequal to the configured total.
                 return (1 * GIB, 3 * GIB)
 
-            def get_configured_capacity_bytes(self) -> dict[L1BackendType, int]:
-                return configured
-
             def memcheck(self) -> bool:
                 return True
 
         manager = L1Manager.__new__(L1Manager)
         manager._memory_manager = cast("L1ManagerProtocol", _MemoryManager())
-        # Capacity derives from config, so it must yield exactly `configured`.
-        manager._config = _config_yielding(configured)
-        # report_status reads the precomputed total, not the live config.
-        manager._configured_capacity_bytes = sum(configured.values())
+        # report_status reads the total precomputed at construction.
+        manager._configured_capacity_bytes = sum(
+            configured_l1_capacity_bytes(_config_yielding(configured)).values()
+        )
         manager._objects = {}
         manager._write_ttl_seconds = 600
         manager._read_ttl_seconds = 600
@@ -367,12 +355,17 @@ class TestReportStatusSharesTheSource:
         )
         assert manager.report_status()["memory_configured_bytes"] == 110 * GIB
 
-    def test_status_and_capacity_api_agree(self) -> None:
+    def test_status_and_capacity_report_agree(self) -> None:
+        # The point of one shared derivation: the two consumers of it --
+        # report_status and the coordinator capacity report -- cannot drift.
         configured = {L1BackendType.DEVDAX: 100 * GIB, L1BackendType.DRAM: 10 * GIB}
         manager = self._l1_manager(configured)
-        assert manager.report_status()["memory_configured_bytes"] == sum(
-            manager.get_configured_capacity_bytes().values()
+        reported = sum(
+            module.capacity_bytes
+            for module in _capacities(configured, [])
+            if module.tier == Tier.L1
         )
+        assert manager.report_status()["memory_configured_bytes"] == reported
 
     def test_unconfigured_tier_reports_zero_not_the_heap(self) -> None:
         manager = self._l1_manager({})

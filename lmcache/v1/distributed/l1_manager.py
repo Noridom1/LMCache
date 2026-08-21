@@ -11,7 +11,7 @@ import threading
 # First Party
 from lmcache.lmcache_native import TTLLock
 from lmcache.logging import init_logger
-from lmcache.v1.distributed.api import L1BackendType, MemoryLayoutDesc, ObjectKey
+from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.config import L1ManagerConfig, configured_l1_capacity_bytes
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import L1ManagerListener, L1ObjectMeta
@@ -203,8 +203,6 @@ class L1Manager:
         else:
             self._memory_manager = L1MemoryManager(config.memory_config)
 
-        # Retained so configured capacity comes from one source.
-        self._config = config
         # Precomputed: it derives from config alone and never changes, and
         # report_status runs under the global L1 lock on a hot polling path.
         self._configured_capacity_bytes = sum(
@@ -845,17 +843,6 @@ class L1Manager:
             via "L1ManagerListener" to notify the memory usage changes.
         """
         return self._memory_manager.get_memory_usage()
-
-    def get_configured_capacity_bytes(self) -> dict[L1BackendType, int]:
-        """Return the configured capacity of each L1 backing medium.
-
-        Unlike :meth:`get_memory_usage`'s total, which can be the grown
-        heap, this is the declared size and is stable from boot.
-
-        Returns:
-            Configured bytes per medium, omitting any sized zero.
-        """
-        return configured_l1_capacity_bytes(self._config)
 
     def get_l1_memory_desc(self):
         """Return an L1MemoryDesc describing the underlying L1 memory buffer."""
