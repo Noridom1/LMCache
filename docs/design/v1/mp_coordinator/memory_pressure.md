@@ -29,17 +29,21 @@ One writer: `capacity_reports` on `POST /events`, replacing a server's
 declaration wholesale.
 
 `StorageManager` publishes `SM_CAPACITY_CHANGED` on the observability bus and
-the cache-event subscriber ships it on its next flush. It fires twice over a
-server's life:
+the cache-event subscriber ships it on its next flush. It fires:
 
-- **Once at startup**, from `publish_capacity()`, called by the HTTP-server
-  lifespan immediately after the subscriber is registered. Publishing any
-  earlier would reach no subscriber, and without it a server that never
-  reconfigures would never declare at all.
+- **After every successful registration**, via the `on_registered` hook
+  `keep_registered` calls, wired to `publish_capacity()`. This covers the
+  first registration — without which a server that never reconfigures would
+  never declare at all — and, critically, every *re*-registration. The
+  coordinator holds declarations in memory only, so a restarted one has
+  forgotten them; re-registration is the single event that tells a server its
+  declaration may be gone. Nothing else would resend it, and the fleet view
+  would sit at `declared_capacity: false` indefinitely.
 - **On every topology change** — adapter added, removed, or reconfigured.
 
-Registration deliberately carries no capacity. One path means the coordinator
-cannot hold a declaration that disagrees with the event stream, and it closes
+Registration deliberately carries no capacity in its *body*. One path means
+the coordinator cannot hold a declaration that disagrees with the event
+stream, and it closes
 a real hole: registration and event reporting are separately configurable, so
 a server registering without event reporting used to declare capacity whose
 usage never arrived, making every compartment read as a confident `0.0`
@@ -54,9 +58,9 @@ not lose it.
 Reports are ordered on `(incarnation, revision)`, the same fencing the event
 batches use. Revision alone would not do: it restarts with the process, so a
 restarted server's first report would look older than its predecessor's last
-and be rejected for good. The registry ignores a stamp it has already passed
-— otherwise two reconfigures racing could
-let an older full declaration overwrite a newer topology.
+and be rejected for good. The registry ignores a stamp it has already passed —
+otherwise two reconfigures racing could let an older full declaration
+overwrite a newer topology.
 
 Capacity does not ride the batch envelope itself: `CacheEventBatch` requires
 a non-empty `backend`, rejects `Tier.ALL`, and every entry needs an
@@ -78,7 +82,7 @@ on change keeps the volume proportional to what actually varies.
 MP server                                   Coordinator
 ─────────                                   ───────────
 StorageManager.publish_capacity()
-  L1: configured_l1_capacity_bytes(l1_config)
+  L1: get_configured_capacity_bytes(l1_config)
       → one entry per backing medium
   L2: per adapter, total_capacity_bytes
       + shared flag from its config
@@ -121,14 +125,14 @@ total would leave two compartments of usage sharing one denominator.
 
 ## Capacity is the configured size, not the live heap
 
-`configured_l1_capacity_bytes()` is the denominator rather than
+`get_configured_capacity_bytes()` is the denominator rather than
 `get_memory_usage()[1]`. On the default lazy allocator that total is the
 **currently grown heap**: it starts small and grows on demand, so a freshly
 booted server would report itself nearly full and then appear to drain as the
 pool warms. The configured size is stable from boot and is the only sound
 denominator.
 
-| Manager | `get_memory_usage()[1]` | `configured_l1_capacity_bytes()` |
+| Manager | `get_memory_usage()[1]` | `get_configured_capacity_bytes()` |
 | --- | --- | --- |
 | `L1MemoryManager` (default, lazy) | grown heap | `{dram: size_in_bytes}` |
 | `GDSL1MemoryManager` | configured slab | `{gds: size_in_bytes}` |
@@ -178,17 +182,22 @@ that would hide a misconfiguration.
   until its first report lands. A report replaces the set wholesale: a
   server that dropped an adapter must not keep the old compartment's
   capacity.
-- **Fencing** (`fence_instance`, on restart or departure) discards the
-  instance's **L1** bytes. L1 lives in the reporting process and dies with
-  it; L2 bytes outlive the reporter and leave only through `DELETE`.
-- **Deregistration** drops the capacity declaration. A departed server's caps
-  describe a process that no longer exists, and keeping them would grow
+- **Fencing** discards the instance's **L1** bytes. L1 lives in the reporting
+  process and dies with it; L2 bytes outlive the reporter and leave only
+  through `DELETE`. Three paths reach it: a higher incarnation arriving on
+  the stream (restart), the stale-eviction loop (heartbeat timeout), and
+  `DELETE /instances/{id}` (clean shutdown). That last one used to be
+  missing, so a server that left cleanly kept reporting L1 bytes forever —
+  the eviction loop could never reach it, having already been removed from
+  the registry.
+- **Deregistration** also drops the capacity declaration. A departed server's
+  caps describe a process that no longer exists, and keeping them would grow
   without bound across a churning fleet. Its surviving L2 bytes are still
   reported, without a ratio.
 
 An instance appears in `GET /instances/usage` when it is registered, when it
-holds bytes, or when it has declared capacity — so a deregistered server whose L2
-placements survive is not silently dropped.
+holds bytes, or when it has declared capacity — so a deregistered server whose
+L2 placements survive is not silently dropped.
 
 ## Scope
 
