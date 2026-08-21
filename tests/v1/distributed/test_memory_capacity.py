@@ -18,7 +18,7 @@ from lmcache.v1.distributed.config import (
     GdsL1Config,
     L1ManagerConfig,
     L1MemoryManagerConfig,
-    configured_l1_capacity_bytes,
+    get_configured_capacity_bytes,
 )
 from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.memory_manager.l1_manager_protocol import L1ManagerProtocol
@@ -176,10 +176,10 @@ class TestConfiguredL1Capacity:
     def test_cpu_tier_reports_configured_size_not_grown_heap(self) -> None:
         # The lazy allocator grows, so its current heap is not the capacity.
         config = self._config(size_in_bytes=40 * GIB)
-        assert configured_l1_capacity_bytes(config) == {L1BackendType.DRAM: 40 * GIB}
+        assert get_configured_capacity_bytes(config) == {L1BackendType.DRAM: 40 * GIB}
 
     def test_unconfigured_tier_reports_nothing_rather_than_zero(self) -> None:
-        assert configured_l1_capacity_bytes(self._config()) == {}
+        assert get_configured_capacity_bytes(self._config()) == {}
 
     def test_pure_devdax_reports_one_medium(self) -> None:
         # An unset devdax size means the whole tier is Device-DAX.
@@ -189,7 +189,9 @@ class TestConfiguredL1Capacity:
             use_lazy=False,
             shm_name="",
         )
-        assert configured_l1_capacity_bytes(config) == {L1BackendType.DEVDAX: 100 * GIB}
+        assert get_configured_capacity_bytes(config) == {
+            L1BackendType.DEVDAX: 100 * GIB
+        }
 
     def test_hybrid_devdax_splits_into_two_mediums(self) -> None:
         # L1 events tag placements per medium, so capacity must too.
@@ -200,7 +202,7 @@ class TestConfiguredL1Capacity:
             use_lazy=False,
             shm_name="",
         )
-        assert configured_l1_capacity_bytes(config) == {
+        assert get_configured_capacity_bytes(config) == {
             L1BackendType.DEVDAX: 100 * GIB,
             L1BackendType.DRAM: 10 * GIB,
         }
@@ -212,7 +214,7 @@ class TestConfiguredL1Capacity:
                 size_in_bytes=8 * GIB, file_location="/tmp/gds-slab"
             ),
         )
-        assert configured_l1_capacity_bytes(config) == {L1BackendType.GDS: 8 * GIB}
+        assert get_configured_capacity_bytes(config) == {L1BackendType.GDS: 8 * GIB}
 
     def test_matches_the_devdax_manager_arena_split(self) -> None:
         # Mirrors DevDaxL1MemoryManager.__init__; catches drift in that split.
@@ -227,7 +229,7 @@ class TestConfiguredL1Capacity:
         local_size = (
             memory_config.size_in_bytes if memory_config.devdax_size_in_bytes else 0
         )
-        derived = configured_l1_capacity_bytes(
+        derived = get_configured_capacity_bytes(
             L1ManagerConfig(memory_config=memory_config)
         )
         assert derived[L1BackendType.DEVDAX] == devdax_size
@@ -243,7 +245,7 @@ class TestConfiguredL1Capacity:
             shm_name="",
         )
         config = L1ManagerConfig(memory_config=memory_config)
-        assert sum(configured_l1_capacity_bytes(config).values()) == (
+        assert sum(get_configured_capacity_bytes(config).values()) == (
             memory_config.size_in_bytes + memory_config.devdax_size_in_bytes
         )
 
@@ -333,7 +335,7 @@ class TestReportStatusSharesTheSource:
         manager._memory_manager = cast("L1ManagerProtocol", _MemoryManager())
         # report_status reads the total precomputed at construction.
         manager._configured_capacity_bytes = sum(
-            configured_l1_capacity_bytes(_config_yielding(configured)).values()
+            get_configured_capacity_bytes(_config_yielding(configured)).values()
         )
         manager._objects = {}
         manager._write_ttl_seconds = 600

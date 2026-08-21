@@ -28,7 +28,7 @@ from lmcache.v1.distributed.bitmap_ops import fold_unfold_ranked
 from lmcache.v1.distributed.config import (
     EvictionConfig,
     StorageManagerConfig,
-    configured_l1_capacity_bytes,
+    get_configured_capacity_bytes,
 )
 from lmcache.v1.distributed.error import L1Error, strerror
 from lmcache.v1.distributed.internal_api import L1MemoryDesc, L2AdapterListener
@@ -868,7 +868,7 @@ class StorageManager:
                 capacity_bytes=configured,
                 shared=False,
             )
-            for backend, configured in configured_l1_capacity_bytes(
+            for backend, configured in get_configured_capacity_bytes(
                 self._l1_config
             ).items()
         ]

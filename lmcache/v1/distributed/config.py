@@ -212,7 +212,7 @@ class L1ManagerConfig:
     """ Time to live for each object's read lock. Default is 300s (5 minutes). """
 
 
-def configured_l1_capacity_bytes(
+def get_configured_capacity_bytes(
     config: L1ManagerConfig,
 ) -> dict[L1BackendType, int]:
     """Return the configured L1 capacity of each backing medium.

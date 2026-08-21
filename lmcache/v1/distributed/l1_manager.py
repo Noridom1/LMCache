@@ -12,7 +12,7 @@ import threading
 from lmcache.lmcache_native import TTLLock
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
-from lmcache.v1.distributed.config import L1ManagerConfig, configured_l1_capacity_bytes
+from lmcache.v1.distributed.config import L1ManagerConfig, get_configured_capacity_bytes
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import L1ManagerListener, L1ObjectMeta
 from lmcache.v1.distributed.memory_manager import (
@@ -206,7 +206,7 @@ class L1Manager:
         # Precomputed: it derives from config alone and never changes, and
         # report_status runs under the global L1 lock on a hot polling path.
         self._configured_capacity_bytes = sum(
-            configured_l1_capacity_bytes(config).values()
+            get_configured_capacity_bytes(config).values()
         )
         self._write_ttl_seconds = config.write_ttl_seconds
         self._read_ttl_seconds = config.read_ttl_seconds

@@ -215,7 +215,7 @@ class MPServerMessage(UsageMessage):
         # load it).
         # First Party
         from lmcache import __version__
-        from lmcache.v1.distributed.config import configured_l1_capacity_bytes
+        from lmcache.v1.distributed.config import get_configured_capacity_bytes
         from lmcache.v1.distributed.l2_adapters.config import (
             get_type_name_for_config,
         )
@@ -224,7 +224,7 @@ class MPServerMessage(UsageMessage):
         memory_config = l1_config.memory_config
         # Shared derivation, so this and the fleet memory view agree. The
         # medium label stays here: its exact strings are wire format.
-        l1_size_bytes = sum(configured_l1_capacity_bytes(l1_config).values())
+        l1_size_bytes = sum(get_configured_capacity_bytes(l1_config).values())
         if l1_config.gds_l1_config is not None:
             l1_medium = "gds"
         else:
