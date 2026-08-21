@@ -474,6 +474,7 @@ def _wire_capacity_publishing(sm: StorageManager) -> None:
         sm: The partially-constructed storage manager to wire up.
     """
     sm._lifecycle_lock = threading.Lock()
+    sm._capacity_lock = threading.Lock()
     sm._capacity_revision = 0
     sm._event_bus = cast(EventBus, _RecordingBus())
     # Declares no L1, keeping these tests about the L2 path.

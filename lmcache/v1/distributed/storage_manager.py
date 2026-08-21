@@ -96,7 +96,10 @@ class StorageManager:
         # Serializes add_l2_adapter / delete_l2_adapter against each other.
         self._lifecycle_lock = threading.Lock()
         # Bumped on every capacity-topology change, so the coordinator can
-        # reject a declaration that arrives late.
+        # reject a declaration that arrives late. Its own lock, not
+        # _lifecycle_lock: publishing must not queue behind an adapter
+        # teardown, which can take its full 30s timeout.
+        self._capacity_lock = threading.Lock()
         self._capacity_revision = 0
         # Guards the _l2_adapters and _adapter_descriptors dicts.
         self._adapters_lock = threading.Lock()
@@ -848,12 +851,11 @@ class StorageManager:
     def publish_capacity(self) -> None:
         """Announce the current capacity topology on the event bus.
 
-        Call once after the cache-event subscriber is registered, so the
-        coordinator learns this server's capacities even if nothing is ever
-        reconfigured. Later changes announce themselves.
+        Called after every coordinator registration, so a restarted
+        coordinator relearns this server's capacities even if nothing is
+        ever reconfigured. Later changes announce themselves.
         """
-        with self._lifecycle_lock:
-            self._publish_capacity_changed()
+        self._publish_capacity_changed()
 
     def _build_capacities(self) -> list[ModuleMemoryCapacity]:
         """Assemble one capacity entry per memory compartment.
@@ -965,18 +967,32 @@ class StorageManager:
     def _publish_capacity_changed(self) -> None:
         """Bump the revision and announce the new topology.
 
-        Call with ``_lifecycle_lock`` held. The event carries the whole
-        declaration, not a delta, so a dropped one is repaired by the next
-        rather than leaving the coordinator permanently wrong.
+        Takes ``_capacity_lock`` only, which is held for the bump and the
+        snapshot build and nothing else. Pairing them matters: unpaired, two
+        racing publishes can tag an older topology with a newer revision,
+        and the coordinator keeps the highest revision it sees. Reachable in
+        practice, since registration publishes from the event loop while a
+        worker may be adding an adapter.
+
+        ``_build_capacities`` guards its own reads (``_snapshot_adapters``
+        takes ``_adapters_lock``), so ``_lifecycle_lock`` is not needed --
+        and holding it here would let a registration block for the full
+        ``delete_l2_adapter`` timeout.
+
+        The event carries the whole declaration, not a delta, so a dropped
+        one is repaired by the next rather than leaving the coordinator
+        permanently wrong.
         """
-        self._capacity_revision += 1
+        with self._capacity_lock:
+            revision = self._capacity_revision = self._capacity_revision + 1
+            modules = tuple(self._build_capacities())
         self._event_bus.publish(
             Event(
                 event_type=EventType.SM_CAPACITY_CHANGED,
                 metadata={
                     "snapshot": CapacitySnapshot(
-                        revision=self._capacity_revision,
-                        modules=tuple(self._build_capacities()),
+                        revision=revision,
+                        modules=modules,
                     )
                 },
             )

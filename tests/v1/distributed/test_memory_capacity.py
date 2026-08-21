@@ -85,6 +85,7 @@ class _StorageManagerStub:
         self._l1_config = _config_yielding(l1)
         self._adapters = adapters
         self._lifecycle_lock = threading.Lock()
+        self._capacity_lock = threading.Lock()
         self._capacity_revision = 0
         self._event_bus = _RecordingBus()
 
@@ -425,3 +426,29 @@ class TestCapacityChangePublishing:
         assert len(stub._event_bus.events) == 1
         snapshot = stub._event_bus.events[0].metadata["snapshot"]
         assert [(m.tier, m.backend) for m in snapshot.modules] == [(Tier.L1, "dram")]
+
+
+class TestCapacityPublishLocking:
+    """Publishing must not queue behind adapter lifecycle work."""
+
+    def test_publish_does_not_take_the_lifecycle_lock(self) -> None:
+        # add/delete/reconfigure hold _lifecycle_lock, and delete can hold
+        # it for its full timeout. Publishing runs on every registration, so
+        # taking that lock would stall registration behind a teardown.
+        stub = _StorageManagerStub({L1BackendType.DRAM: 8 * GIB}, [])
+        stub._lifecycle_lock.acquire()
+        try:
+            StorageManager.publish_capacity(cast("StorageManager", stub))
+        finally:
+            stub._lifecycle_lock.release()
+        assert len(stub._event_bus.events) == 1
+
+    def test_revision_and_modules_are_paired(self) -> None:
+        # Unpaired, two racing publishes could tag an older topology with a
+        # newer revision -- and the coordinator keeps the highest revision.
+        stub = _StorageManagerStub({L1BackendType.DRAM: 8 * GIB}, [])
+        StorageManager.publish_capacity(cast("StorageManager", stub))
+        StorageManager.publish_capacity(cast("StorageManager", stub))
+        snapshots = [e.metadata["snapshot"] for e in stub._event_bus.events]
+        assert [s.revision for s in snapshots] == [1, 2]
+        assert all(len(s.modules) == 1 for s in snapshots)
