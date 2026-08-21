@@ -19,6 +19,8 @@ from lmcache.v1.mp_coordinator.api import (
 from lmcache.v1.mp_coordinator.app import create_app
 from lmcache.v1.mp_coordinator.config import MPCoordinatorConfig
 from lmcache.v1.mp_coordinator.http_apis.dependencies import CoordinatorContext
+from lmcache.v1.mp_coordinator.persistence.durable_component import PersistenceType
+from lmcache.v1.mp_coordinator.server_config import ModuleCapacity, ServerConfigRegistry
 
 GIB = 1 << 30
 
@@ -566,3 +568,84 @@ class TestDeparture:
         module = _module(body, "l2", "fs")
         assert module["used_bytes"] == 5 * GIB
         assert module["usage_ratio"] is None
+
+
+class TestDurableComponent:
+    """The registry persists itself like every other event consumer."""
+
+    def _registry(self) -> ServerConfigRegistry:
+        """A registry holding one two-compartment declaration."""
+        registry = ServerConfigRegistry()
+        for offset, (tier, backend, capacity, shared) in enumerate(
+            [
+                (Tier.L1, "dram", 40 * GIB, False),
+                (Tier.L2, "s3", 0, True),
+            ]
+        ):
+            registry.consume(
+                CacheEventBatch(
+                    instance_id="mp-1",
+                    incarnation=5,
+                    seq=offset + 1,
+                    event_type=CacheEventType.CONFIG,
+                    tier=tier,
+                    backend=backend,
+                    shared=shared,
+                    capacity_bytes=capacity,
+                    capacity_revision=3,
+                )
+            )
+        return registry
+
+    def test_it_names_itself_and_where_it_belongs(self) -> None:
+        registry = ServerConfigRegistry()
+        assert registry.name == "server_config"
+        assert registry.persistence_type == PersistenceType.CHECKPOINT
+
+    def test_capture_is_plain_data(self) -> None:
+        # Domain objects would make every artifact writer understand what a
+        # section means.
+        captured = self._registry().capture()
+        assert captured == {
+            "declarations": [
+                (
+                    "mp-1",
+                    5,
+                    3,
+                    [("l1", "dram", 40 * GIB, False), ("l2", "s3", 0, True)],
+                )
+            ]
+        }
+
+    def test_restore_round_trips_the_declaration(self) -> None:
+        restored = ServerConfigRegistry()
+        restored.restore(self._registry().capture())
+        assert restored.get("mp-1") == (
+            ModuleCapacity(Tier.L1, "dram", 40 * GIB, False),
+            ModuleCapacity(Tier.L2, "s3", 0, True),
+        )
+
+    def test_restore_keeps_the_stamp_so_a_straggler_cannot_win(self) -> None:
+        # Without the stamp a restored registry starts from scratch and
+        # accepts a report from before the capture, regressing the topology
+        # it just loaded.
+        restored = ServerConfigRegistry()
+        restored.restore(self._registry().capture())
+        restored.consume(
+            CacheEventBatch(
+                instance_id="mp-1",
+                incarnation=5,
+                seq=99,
+                event_type=CacheEventType.CONFIG,
+                tier=Tier.L1,
+                backend="dram",
+                capacity_bytes=1 * GIB,
+                capacity_revision=2,
+            )
+        )
+        assert restored.get("mp-1")[0].capacity_bytes == 40 * GIB
+
+    def test_restore_refuses_a_non_empty_registry(self) -> None:
+        registry = self._registry()
+        with pytest.raises(ValueError, match="requires an empty registry"):
+            registry.restore(registry.capture())

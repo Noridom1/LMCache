@@ -209,6 +209,14 @@ that would hide a misconfiguration.
   without bound across a churning fleet. Its surviving L2 bytes are still
   reported, without a ratio.
 
+The registry is also a `DurableComponent`, like every other event consumer.
+Its section is `server_config` and its type is `CHECKPOINT`: declarations are
+derived from the event stream, and every server re-declares on registration,
+so they are rebuildable. A capture carries each declaration's
+`(incarnation, revision)` stamp with it -- without that, a restored registry
+would start from scratch and accept a straggler from before the capture,
+regressing the topology it had just loaded.
+
 An instance appears in `GET /instances/usage` when it is registered, when it
 holds bytes, or when it has declared capacity — so a deregistered server whose
 L2 placements survive is not silently dropped.

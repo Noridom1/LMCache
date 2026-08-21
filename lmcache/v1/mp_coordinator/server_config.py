@@ -18,13 +18,16 @@ retires a compartment: a declaration that omits it simply never adds it.
 from __future__ import annotations
 
 # Standard
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import cast
 import threading
 
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import Tier
 from lmcache.v1.mp_coordinator.api import CacheEventBatch, CacheEventType
+from lmcache.v1.mp_coordinator.persistence.durable_component import PersistenceType
 
 logger = init_logger(__name__)
 
@@ -159,3 +162,81 @@ class ServerConfigRegistry:
         with self._lock:
             self._by_instance.pop(instance_id, None)
             self._stamps.pop(instance_id, None)
+
+    @property
+    def name(self) -> str:
+        """Name of the capacity registry's section in a checkpoint."""
+        return "server_config"
+
+    @property
+    def persistence_type(self) -> PersistenceType:
+        """Declarations come off the cache-event stream and every server
+        re-declares on registration, so they are checkpoint state."""
+        return PersistenceType.CHECKPOINT
+
+    def capture(self) -> Mapping[str, object]:
+        """Return each server's declaration with the stamp that ordered it.
+
+        The stamp travels with the modules. Without it a restored registry
+        would start from scratch and accept a straggler from before the
+        capture, regressing the topology it just loaded.
+
+        Returns:
+            ``{"declarations": [(instance_id, incarnation, revision,
+            [(tier, backend, capacity_bytes, shared), ...]), ...]}``.
+        """
+        with self._lock:
+            return {
+                "declarations": [
+                    (
+                        instance_id,
+                        incarnation,
+                        revision,
+                        [
+                            (
+                                module.tier.value,
+                                module.backend,
+                                module.capacity_bytes,
+                                module.shared,
+                            )
+                            for module in self._by_instance.get(
+                                instance_id, {}
+                            ).values()
+                        ],
+                    )
+                    for instance_id, (incarnation, revision) in self._stamps.items()
+                ]
+            }
+
+    def restore(self, state: Mapping[str, object]) -> None:
+        """Load captured declarations and the stamps that ordered them.
+
+        Call once at startup.
+
+        Args:
+            state: A :meth:`capture` value.
+
+        Raises:
+            ValueError: If any declaration is already held.
+        """
+        declarations = cast(
+            "list[tuple[str, int, int, list[tuple[str, str, int, bool]]]]",
+            state["declarations"],
+        )
+        with self._lock:
+            if self._by_instance or self._stamps:
+                raise ValueError(
+                    "restore() requires an empty registry (holds "
+                    f"{len(self._by_instance)} declarations)"
+                )
+            for instance_id, incarnation, revision, modules in declarations:
+                self._stamps[instance_id] = (incarnation, revision)
+                self._by_instance[instance_id] = {
+                    (Tier(tier_value), backend): ModuleCapacity(
+                        tier=Tier(tier_value),
+                        backend=backend,
+                        capacity_bytes=capacity_bytes,
+                        shared=shared,
+                    )
+                    for tier_value, backend, capacity_bytes, shared in modules
+                }
