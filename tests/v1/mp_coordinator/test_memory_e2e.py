@@ -76,19 +76,46 @@ def coordinator():
         thread.join(timeout=5.0)
 
 
+def _declare(
+    base: str,
+    instance_id: str,
+    modules: list[dict[str, object]],
+    incarnation: int = 1,
+    revision: int = 1,
+) -> None:
+    """Declare ``modules`` as a capacity report on the event stream."""
+    response = requests.post(
+        f"{base}/events",
+        json={
+            "batches": [],
+            "capacity_reports": [
+                {
+                    "instance_id": instance_id,
+                    "incarnation": incarnation,
+                    "revision": revision,
+                    "modules": modules,
+                }
+            ],
+        },
+        timeout=2,
+    )
+    assert response.status_code == 200, response.text
+
+
 def _register(base: str, instance_id: str, modules: list[dict[str, object]]) -> None:
-    """Register an mp server declaring ``modules``."""
+    """Register an mp server, then declare ``modules`` over the event stream."""
     response = requests.post(
         f"{base}/instances",
         json={
             "instance_id": instance_id,
             "ip": "127.0.0.1",
             "http_port": 9999,
-            "memory_modules": modules,
         },
         timeout=2,
     )
     assert response.status_code == 200, response.text
+    if modules:
+        _declare(base, instance_id, modules)
 
 
 def _publish(
@@ -300,20 +327,24 @@ def test_producer_declaration_yields_real_ratios_over_real_http(coordinator) -> 
     """
     # First Party
     from lmcache.v1.distributed.api import ModuleMemoryCapacity
-    from lmcache.v1.mp_coordinator.schemas import ModuleCapacityModel, RegisterRequest
+    from lmcache.v1.mp_coordinator.schemas import (
+        ModuleCapacityModel,
+        ServerCapacityReport,
+    )
 
-    # Shape get_memory_capacities() returns for a hybrid Device-DAX server.
+    # Shape _build_capacities() returns for a hybrid Device-DAX server.
     produced = [
         ModuleMemoryCapacity(Tier.L1, "devdax", 100 * GIB, False),
         ModuleMemoryCapacity(Tier.L1, "dram", 10 * GIB, False),
         ModuleMemoryCapacity(Tier.L2, "fs", 200 * GIB, False),
         ModuleMemoryCapacity(Tier.L2, "s3", 0, True),
     ]
-    body = RegisterRequest(
+    _register(coordinator, "mp-1", [])
+    report = ServerCapacityReport(
         instance_id="mp-1",
-        ip="127.0.0.1",
-        http_port=9999,
-        memory_modules=[
+        incarnation=1,
+        revision=1,
+        modules=[
             ModuleCapacityModel(
                 tier=c.tier,
                 backend=c.backend,
@@ -324,7 +355,9 @@ def test_producer_declaration_yields_real_ratios_over_real_http(coordinator) -> 
         ],
     )
     response = requests.post(
-        f"{coordinator}/instances", json=body.model_dump(mode="json"), timeout=2
+        f"{coordinator}/events",
+        json={"batches": [], "capacity_reports": [report.model_dump(mode="json")]},
+        timeout=2,
     )
     assert response.status_code == 200, response.text
 

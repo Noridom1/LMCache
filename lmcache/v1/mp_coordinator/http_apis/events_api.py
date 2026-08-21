@@ -52,6 +52,7 @@ async def report_cache_events(
                 )
                 for m in report.modules
             ],
+            report.incarnation,
             report.revision,
         )
     event_gate = ctx.event_gate

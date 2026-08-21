@@ -122,14 +122,17 @@ class ServerCapacityReport(BaseModel):
 
     Attributes:
         instance_id: The declaring server. Non-empty.
-        revision: Monotonic per-process counter. The coordinator ignores a
-            revision it has already passed, so out-of-order reports cannot
-            regress the topology. Resets on restart, which is why a
-            registration overrides it.
+        incarnation: The emitting process's incarnation, as on
+            :class:`CacheEventBatch`. Orders reports across restarts, which
+            ``revision`` alone cannot since it restarts with the process.
+        revision: Monotonic counter within one incarnation. The coordinator
+            ignores a ``(incarnation, revision)`` it has already passed, so
+            out-of-order reports cannot regress the topology.
         modules: The server's current compartments, replacing any prior set.
     """
 
     instance_id: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+    incarnation: int = Field(ge=0)
     revision: int = Field(ge=0)
     modules: list[ModuleCapacityModel] = Field(default_factory=list)
 
@@ -151,13 +154,6 @@ class RegisterRequest(BaseModel):
         mq_port: Port of the instance's ZMQ message-queue server that P2P peers
             send lookup/unlock RPCs to, reachable at the instance's ``ip``.
             Optional -- 0 when P2P is disabled.
-        memory_modules: Per-compartment capacities (the L1 pool, one entry
-            per L2 adapter). Empty declares nothing, and usage is then
-            reported without a ratio. A re-registration replaces the
-            previous declaration wholesale.
-        capacity_revision: The revision ``memory_modules`` was taken at.
-            Registration resets the coordinator's stored revision, so a
-            restarted server whose counter went backwards is still accepted.
     """
 
     instance_id: Annotated[str, StringConstraints(strip_whitespace=True)] = ""
@@ -166,8 +162,6 @@ class RegisterRequest(BaseModel):
     metadata: dict[str, str] = Field(default_factory=dict)
     p2p_advertised_url: Annotated[str, StringConstraints(strip_whitespace=True)] = ""
     mq_port: int = Field(default=0, ge=0, le=65535)
-    memory_modules: list[ModuleCapacityModel] = Field(default_factory=list)
-    capacity_revision: int = Field(default=0, ge=0)
 
 
 class RegisterResponse(BaseModel):

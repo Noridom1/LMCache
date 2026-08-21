@@ -845,24 +845,15 @@ class StorageManager:
             out_by_type.setdefault(desc.type_name, []).append(usage)
         return out_by_type
 
-    def get_memory_capacities(self) -> CapacitySnapshot:
-        """Report every memory compartment's configured capacity.
+    def publish_capacity(self) -> None:
+        """Announce the current capacity topology on the event bus.
 
-        Sent to the coordinator at registration, where it is joined against
-        event-derived usage. L1 is reported per backing medium, L2 per
-        adapter, each keeping its ``shared`` flag so a pool several
-        instances mount is counted once. An adapter whose ``get_usage()``
-        raises is skipped rather than given a wrong capacity.
-
-        Returns:
-            The current revision and one entry per compartment.
-            ``capacity_bytes == 0`` means no declared limit.
+        Call once after the cache-event subscriber is registered, so the
+        coordinator learns this server's capacities even if nothing is ever
+        reconfigured. Later changes announce themselves.
         """
         with self._lifecycle_lock:
-            return CapacitySnapshot(
-                revision=self._capacity_revision,
-                modules=tuple(self._build_capacities()),
-            )
+            self._publish_capacity_changed()
 
     def _build_capacities(self) -> list[ModuleMemoryCapacity]:
         """Assemble one capacity entry per memory compartment.

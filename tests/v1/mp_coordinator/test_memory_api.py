@@ -46,22 +46,52 @@ def _ctx(client: TestClient) -> CoordinatorContext:
     return cast("FastAPI", client.app).state.ctx
 
 
+def _declare(
+    client: TestClient,
+    instance_id: str,
+    modules: list[dict[str, object]],
+    incarnation: int = 1,
+    revision: int = 1,
+) -> None:
+    """Declare ``modules`` as a capacity report on the event stream."""
+    response = client.post(
+        "/events",
+        json={
+            "batches": [],
+            "capacity_reports": [
+                {
+                    "instance_id": instance_id,
+                    "incarnation": incarnation,
+                    "revision": revision,
+                    "modules": modules,
+                }
+            ],
+        },
+    )
+    assert response.status_code == 200, response.text
+
+
 def _register(
     client: TestClient,
     instance_id: str,
     modules: list[dict[str, object]],
 ) -> None:
-    """Register an instance declaring ``modules``."""
+    """Register an instance, then declare ``modules`` as a report.
+
+    Registration carries no capacity: it arrives on the event stream, so a
+    declaring server takes both steps.
+    """
     response = client.post(
         "/instances",
         json={
             "instance_id": instance_id,
             "ip": "10.0.0.1",
             "http_port": 8000,
-            "memory_modules": modules,
         },
     )
     assert response.status_code == 200
+    if modules:
+        _declare(client, instance_id, modules)
 
 
 def _ingest(
@@ -269,29 +299,9 @@ class TestFleetMemory:
 
 
 class TestRegistration:
-    def test_re_registration_replaces_the_declaration(self, client: TestClient) -> None:
-        # A server that dropped an adapter must not keep its old capacity.
-        _register(
-            client,
-            "mp-1",
-            [
-                {"tier": "l1", "backend": "dram", "capacity_bytes": 40 * GIB},
-                {"tier": "l2", "backend": "fs", "capacity_bytes": 90 * GIB},
-            ],
-        )
-        _register(
-            client,
-            "mp-1",
-            [{"tier": "l1", "backend": "dram", "capacity_bytes": 40 * GIB}],
-        )
-        backends = {
-            (m["tier"], m["backend"])
-            for m in client.get("/memory/mp-1").json()["modules"]
-        }
-        assert backends == {("l1", "dram")}
+    """Registration establishes membership only, never capacity."""
 
-    def test_registration_without_modules_is_accepted(self, client: TestClient) -> None:
-        # Backward compatibility with servers predating this field.
+    def test_registration_alone_declares_nothing(self, client: TestClient) -> None:
         response = client.post(
             "/instances",
             json={"instance_id": "mp-1", "ip": "10.0.0.1", "http_port": 8000},
@@ -299,7 +309,11 @@ class TestRegistration:
         assert response.status_code == 200
         assert client.get("/memory/mp-1").json()["declared_capacity"] is False
 
-    def test_tier_all_is_rejected(self, client: TestClient) -> None:
+    def test_capacity_fields_are_not_accepted_at_registration(
+        self, client: TestClient
+    ) -> None:
+        # Guards the one-path invariant: if these are ever reintroduced on
+        # the register body, capacity has two sources again.
         response = client.post(
             "/instances",
             json={
@@ -307,7 +321,27 @@ class TestRegistration:
                 "ip": "10.0.0.1",
                 "http_port": 8000,
                 "memory_modules": [
-                    {"tier": "all", "backend": "dram", "capacity_bytes": GIB}
+                    {"tier": "l1", "backend": "dram", "capacity_bytes": GIB}
+                ],
+            },
+        )
+        assert response.status_code == 200
+        assert client.get("/memory/mp-1").json()["declared_capacity"] is False
+
+    def test_tier_all_is_rejected(self, client: TestClient) -> None:
+        response = client.post(
+            "/events",
+            json={
+                "batches": [],
+                "capacity_reports": [
+                    {
+                        "instance_id": "mp-1",
+                        "incarnation": 1,
+                        "revision": 1,
+                        "modules": [
+                            {"tier": "all", "backend": "dram", "capacity_bytes": GIB}
+                        ],
+                    }
                 ],
             },
         )
@@ -315,17 +349,13 @@ class TestRegistration:
 
     def test_duplicate_compartment_is_rejected(self, client: TestClient) -> None:
         with pytest.raises(ValueError, match="duplicate capacity declaration"):
-            client.post(
-                "/instances",
-                json={
-                    "instance_id": "mp-1",
-                    "ip": "10.0.0.1",
-                    "http_port": 8000,
-                    "memory_modules": [
-                        {"tier": "l1", "backend": "dram", "capacity_bytes": GIB},
-                        {"tier": "l1", "backend": "dram", "capacity_bytes": 2 * GIB},
-                    ],
-                },
+            _declare(
+                client,
+                "mp-1",
+                [
+                    {"tier": "l1", "backend": "dram", "capacity_bytes": GIB},
+                    {"tier": "l1", "backend": "dram", "capacity_bytes": 2 * GIB},
+                ],
             )
 
 
@@ -333,11 +363,16 @@ class TestCapacityReports:
     """Capacity updates arriving on the event stream, not at registration."""
 
     def _report(
-        self, instance_id: str, revision: int, capacity_bytes: int
+        self,
+        instance_id: str,
+        revision: int,
+        capacity_bytes: int,
+        incarnation: int = 1,
     ) -> dict[str, object]:
         """Build one capacity-report body."""
         return {
             "instance_id": instance_id,
+            "incarnation": incarnation,
             "revision": revision,
             "modules": [
                 {"tier": "l1", "backend": "dram", "capacity_bytes": capacity_bytes}
@@ -370,7 +405,7 @@ class TestCapacityReports:
         ] == pytest.approx(0.25)
 
         # A device was added at runtime: same server, bigger pool.
-        self._post(client, self._report("mp-1", 1, 80 * GIB))
+        self._post(client, self._report("mp-1", 2, 80 * GIB))
         assert _module(client.get("/memory/mp-1").json(), "l1", "dram")[
             "usage_ratio"
         ] == pytest.approx(0.125)
@@ -389,20 +424,26 @@ class TestCapacityReports:
         self._post(client, self._report("mp-1", 2, 10 * GIB))
         assert self._capacity(client, "mp-1") == 80 * GIB
 
-    def test_registration_overrides_a_higher_revision(self, client: TestClient) -> None:
-        # A restarted server's counter goes back to 0; registration is
-        # authoritative or its declarations would be rejected forever.
+    def test_a_new_incarnation_supersedes_a_higher_revision(
+        self, client: TestClient
+    ) -> None:
+        # A restarted server's revision counter goes back to 1. Without
+        # incarnation in the order, every report it ever sends would look
+        # stale and its capacity would never be learned again.
         _register(client, "mp-1", [])
-        self._post(client, self._report("mp-1", 9, 80 * GIB))
-        _register(
-            client,
-            "mp-1",
-            [{"tier": "l1", "backend": "dram", "capacity_bytes": 16 * GIB}],
-        )
+        self._post(client, self._report("mp-1", 9, 80 * GIB, incarnation=1))
+        self._post(client, self._report("mp-1", 1, 16 * GIB, incarnation=2))
         assert self._capacity(client, "mp-1") == 16 * GIB
-        # And a post-restart report at a low revision still applies.
-        self._post(client, self._report("mp-1", 1, 32 * GIB))
-        assert self._capacity(client, "mp-1") == 32 * GIB
+
+    def test_an_older_incarnation_cannot_win_on_revision(
+        self, client: TestClient
+    ) -> None:
+        # The reverse: a straggler from the previous process must lose even
+        # though its revision is far ahead.
+        _register(client, "mp-1", [])
+        self._post(client, self._report("mp-1", 1, 16 * GIB, incarnation=2))
+        self._post(client, self._report("mp-1", 99, 80 * GIB, incarnation=1))
+        assert self._capacity(client, "mp-1") == 16 * GIB
 
     def test_report_replaces_wholesale_so_dropped_modules_vanish(
         self, client: TestClient
@@ -415,7 +456,7 @@ class TestCapacityReports:
                 {"tier": "l2", "backend": "fs", "capacity_bytes": 90 * GIB},
             ],
         )
-        self._post(client, self._report("mp-1", 1, 40 * GIB))
+        self._post(client, self._report("mp-1", 2, 40 * GIB))
         backends = {
             (m["tier"], m["backend"])
             for m in client.get("/memory/mp-1").json()["modules"]

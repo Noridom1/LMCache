@@ -91,6 +91,9 @@ class _StorageManagerStub:
     def _build_capacities(self) -> list[ModuleMemoryCapacity]:
         return StorageManager._build_capacities(cast("StorageManager", self))
 
+    def _publish_capacity_changed(self) -> None:
+        StorageManager._publish_capacity_changed(cast("StorageManager", self))
+
     def _snapshot_adapters(
         self,
     ) -> list[tuple[int, _FakeDescriptor, _FakeAdapter]]:
@@ -104,7 +107,7 @@ def _capacities(
     l1: dict[L1BackendType, int],
     adapters: list[tuple[_FakeDescriptor, _FakeAdapter]],
 ) -> list[ModuleMemoryCapacity]:
-    """Run ``StorageManager.get_memory_capacities`` against fakes.
+    """Run ``StorageManager._build_capacities`` against fakes.
 
     Args:
         l1: Configured L1 capacity per backing medium.
@@ -113,10 +116,7 @@ def _capacities(
     Returns:
         The capacities the method assembles.
     """
-    stub = _StorageManagerStub(l1, adapters)
-    return list(
-        StorageManager.get_memory_capacities(cast("StorageManager", stub)).modules
-    )
+    return _StorageManagerStub(l1, adapters)._build_capacities()
 
 
 def _config_yielding(capacities: dict[L1BackendType, int]) -> L1ManagerConfig:
@@ -407,10 +407,19 @@ class TestCapacityChangePublishing:
         assert stub._event_bus.events[0].event_type == EventType.SM_CAPACITY_CHANGED
 
     def test_snapshot_pairs_the_revision_with_its_own_modules(self) -> None:
-        # Read under one lock, so a reader cannot pair a revision with a
+        # Built under one lock, so a reader cannot pair a revision with a
         # later topology.
         stub = self._stub()
         StorageManager._publish_capacity_changed(cast("StorageManager", stub))
-        snapshot = StorageManager.get_memory_capacities(cast("StorageManager", stub))
+        snapshot = stub._event_bus.events[0].metadata["snapshot"]
         assert snapshot.revision == 1
         assert len(snapshot.modules) == 1
+
+    def test_publish_capacity_declares_without_any_reconfiguration(self) -> None:
+        # The only path by which a server that never reconfigures reaches
+        # the coordinator at all.
+        stub = self._stub()
+        StorageManager.publish_capacity(cast("StorageManager", stub))
+        assert len(stub._event_bus.events) == 1
+        snapshot = stub._event_bus.events[0].metadata["snapshot"]
+        assert [(m.tier, m.backend) for m in snapshot.modules] == [(Tier.L1, "dram")]

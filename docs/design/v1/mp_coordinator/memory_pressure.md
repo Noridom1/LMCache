@@ -3,13 +3,13 @@
 A coordinator-level read-only view of how full each MP server's memory
 compartments are. It joins two things the coordinator holds separately: byte
 usage derived from the admitted cache-event stream, and capacity declared by
-each server at registration. Neither is a pressure reading on its own.
+each server on that same stream. Neither is a pressure reading on its own.
 
 Code: `lmcache/v1/mp_coordinator/controllers/usage_manager.py` (usage view),
 `lmcache/v1/mp_coordinator/server_config.py` (capacity registry),
 `lmcache/v1/mp_coordinator/http_apis/memory_api.py` (REST endpoints),
 `lmcache/v1/distributed/storage_manager.py` (MP-server capacity source),
-`lmcache/v1/mp_coordinator/registrar.py` (MP-server declaration).
+`lmcache/v1/mp_coordinator/cache_events.py` (MP-server declaration).
 
 ## Why
 
@@ -25,15 +25,25 @@ needs. This capability adds only the denominator.
 
 ## How capacity reaches the coordinator
 
-Two writers, both replacing a server's declaration wholesale:
+One writer: `capacity_reports` on `POST /events`, replacing a server's
+declaration wholesale.
 
-- **`POST /instances`** — the baseline, sent at registration. Authoritative:
-  it resets the stored revision, because a restarted process's counter goes
-  back to zero.
-- **`capacity_reports` on `POST /events`** — updates, emitted when the
-  topology changes (adapter added, removed, or reconfigured; a Device-DAX
-  device mapped). `StorageManager` publishes `SM_CAPACITY_CHANGED` on the
-  observability bus; the cache-event subscriber ships it on its next flush.
+`StorageManager` publishes `SM_CAPACITY_CHANGED` on the observability bus and
+the cache-event subscriber ships it on its next flush. It fires twice over a
+server's life:
+
+- **Once at startup**, from `publish_capacity()`, called by the HTTP-server
+  lifespan immediately after the subscriber is registered. Publishing any
+  earlier would reach no subscriber, and without it a server that never
+  reconfigures would never declare at all.
+- **On every topology change** — adapter added, removed, or reconfigured.
+
+Registration deliberately carries no capacity. One path means the coordinator
+cannot hold a declaration that disagrees with the event stream, and it closes
+a real hole: registration and event reporting are separately configurable, so
+a server registering without event reporting used to declare capacity whose
+usage never arrived, making every compartment read as a confident `0.0`
+instead of unknown.
 
 A report carries the **whole declaration**, never a delta. That is what makes
 the lossy event channel acceptable here: a dropped report is repaired by the
@@ -41,8 +51,11 @@ next one, where a dropped byte delta would be permanent. The emitter also
 keeps an unsent report across a publish failure, so a transient outage does
 not lose it.
 
-Each report carries a monotonic per-process `revision`, and the registry
-ignores one it has already passed — otherwise two reconfigures racing could
+Reports are ordered on `(incarnation, revision)`, the same fencing the event
+batches use. Revision alone would not do: it restarts with the process, so a
+restarted server's first report would look older than its predecessor's last
+and be rejected for good. The registry ignores a stamp it has already passed
+— otherwise two reconfigures racing could
 let an older full declaration overwrite a newer topology.
 
 Capacity does not ride the batch envelope itself: `CacheEventBatch` requires
@@ -64,16 +77,16 @@ on change keeps the volume proportional to what actually varies.
 ```
 MP server                                   Coordinator
 ─────────                                   ───────────
-StorageManager.get_memory_capacities()
+StorageManager.publish_capacity()
   L1: configured_l1_capacity_bytes(l1_config)
       → one entry per backing medium
   L2: per adapter, total_capacity_bytes
       + shared flag from its config
         │
-        │  registrar: ModuleMemoryCapacity → ModuleCapacityModel
+        │  subscriber: ModuleMemoryCapacity → ModuleCapacityModel
         ▼
-  POST /instances ──────────────────▶  ServerConfigRegistry.declare()
-   (memory_modules)                      replaces the prior set wholesale
+  POST /events ─────────────────────▶  ServerConfigRegistry.update()
+   (capacity_reports)                    replaces the prior set wholesale
                                                     │
 L2 adapter / L1 manager publish                     │  capacity
   l1.* / l2.* on the event bus                      │
@@ -159,10 +172,11 @@ that would hide a misconfiguration.
 
 ## Lifecycle
 
-- **Registration** declares capacity, before membership is recorded — so a
-  memory read cannot find a server registered but its modules undeclared.
-  Re-registration replaces the set wholesale: a server that dropped an
-  adapter must not keep the old compartment's capacity.
+- **Registration** records membership only. Capacity follows on the event
+  stream, so a just-registered server reads as `declared_capacity: false`
+  until its first report lands. A report replaces the set wholesale: a
+  server that dropped an adapter must not keep the old compartment's
+  capacity.
 - **Fencing** (`fence_instance`, on restart or departure) discards the
   instance's **L1** bytes. L1 lives in the reporting process and dies with
   it; L2 bytes outlive the reporter and leave only through `DELETE`.

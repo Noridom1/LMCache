@@ -138,9 +138,6 @@ async def lifespan(app: FastAPI):
                 heartbeat_interval=coordinator_config.heartbeat_interval,
                 p2p_advertised_url=mp_config.p2p_config.advertise_url,
                 mq_port=mp_config.port if mp_config.p2p_config.enabled else 0,
-                # A probe, not a snapshot: adapters change at runtime, so a
-                # re-registration must publish the topology as it is then.
-                memory_capacities=engine.storage_manager.get_memory_capacities,
             )
         )
     # Optionally report cache events to the coordinator
@@ -159,6 +156,10 @@ async def lifespan(app: FastAPI):
                 flush_interval=coordinator_config.event_flush_interval,
             )
         )
+        # Now that a subscriber exists to carry it, declare this server's
+        # capacities. Publishing any earlier would reach nobody, and the
+        # coordinator would have no denominator until a reconfiguration.
+        engine.storage_manager.publish_capacity()
 
     app.state.coordinator_client = coordinator_client
     app.state.coordinator_registration_task = coordinator_registration_task

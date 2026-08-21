@@ -25,7 +25,6 @@ from lmcache.v1.mp_coordinator.schemas import (
     RegisterRequest,
     RegisterResponse,
 )
-from lmcache.v1.mp_coordinator.server_config import ModuleCapacity
 
 logger = init_logger(__name__)
 
@@ -47,21 +46,8 @@ async def register_instance(
     """
     instance_id = body.instance_id or f"mp-{uuid.uuid4().hex}"
     ctx = get_context(request)
-    # Before membership, so a memory read never finds the instance
-    # registered with its modules still undeclared.
-    ctx.server_config.declare(
-        instance_id,
-        [
-            ModuleCapacity(
-                tier=module.tier,
-                backend=module.backend,
-                capacity_bytes=module.capacity_bytes,
-                shared=module.shared,
-            )
-            for module in body.memory_modules
-        ],
-        body.capacity_revision,
-    )
+    # Capacity is not taken here: it arrives as a report on the cache-event
+    # stream, fenced by (incarnation, revision).
     # Wall-clock registration_time for display; monotonic last_heartbeat_time for
     # NTP-safe stale detection (see registry.stale). register() does the
     # exists-check and write under one lock, so the re_registered flag is correct

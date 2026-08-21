@@ -237,15 +237,6 @@ startup.
      - int
      - Optional (default ``0``). ZMQ message-queue port P2P peers send
        lookup/unlock RPCs to; ``0`` when P2P is disabled.
-   * - ``memory_modules``
-     - array
-     - Optional. The server's memory compartments, each
-       ``{tier, backend, capacity_bytes, shared}``. Sent automatically; it is
-       what makes ``GET /memory`` able to report a usage ratio. Omitting it
-       (or sending ``[]``) is valid -- usage is then reported without a
-       ratio. A re-registration **replaces** the previous set, so a server
-       that dropped an adapter must send its full current list.
-
 **Response** (``200 OK``):
 
 .. code-block:: json
@@ -1154,12 +1145,18 @@ are. A **compartment** is one thing that owns bytes: the L1 pool of a backing
 medium, or one L2 adapter. It is identified by ``(tier, backend)`` -- the same
 pair cache events tag placements with.
 
-Two inputs are joined. **Usage** is derived from the cache-event stream the
-servers already publish. **Capacity** is declared by each server: in
-``memory_modules`` at registration, and thereafter as a capacity report on
-the event stream whenever an adapter is added, removed, or reconfigured. Both
-are automatic; there is nothing to configure beyond pointing servers at a
-coordinator.
+Two inputs are joined, and both ride the cache-event stream. **Usage** is
+derived from the events the servers already publish. **Capacity** arrives as
+a capacity report on the same stream -- once at startup, then whenever an
+adapter is added, removed, or reconfigured. Both are automatic; there is
+nothing to configure beyond pointing servers at a coordinator and leaving
+event reporting enabled.
+
+.. note::
+
+   Capacity travels on the event stream, so disabling event reporting
+   disables both halves together: every ``usage_ratio`` reads ``null``
+   (*unknown*) rather than a ratio against a stale declaration.
 
 These endpoints are read-only. The coordinator never evicts or throttles based
 on them.

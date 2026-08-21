@@ -282,6 +282,7 @@ class CacheEventSubscriber(EventSubscriber):
         snapshot: CapacitySnapshot = event.metadata["snapshot"]
         self._pending_capacity = ServerCapacityReport(
             instance_id=self._instance_id,
+            incarnation=self._incarnation,
             revision=snapshot.revision,
             modules=[
                 ModuleCapacityModel(

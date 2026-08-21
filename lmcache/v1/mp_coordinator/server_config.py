@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Per-MP-server memory capacity, as declared by each server.
+"""Per-MP-server memory capacity, as declared on the event stream.
 
 Cache events report bytes held, never bytes holdable, so servers declare
 capacity separately and this registry stores it. Storage only -- no event
 handling, no pressure math, no liveness.
+
+Declarations arrive as capacity reports on the cache-event stream, fenced
+by ``(incarnation, revision)`` exactly as event batches are: incarnation
+orders process lifetimes, revision orders changes within one.
 """
 
 # Future
@@ -62,63 +66,58 @@ class ModuleCapacity:
 class ServerConfigRegistry:
     """Thread-safe store of each MP server's declared capacities.
 
-    Both writers replace a declaration wholesale, so a dropped L2 adapter's
-    capacity cannot linger. :meth:`declare` wins unconditionally
-    (registration); :meth:`update` is revision-guarded (capacity events).
+    :meth:`update` replaces a declaration wholesale, so a dropped L2
+    adapter's capacity cannot linger, and is fenced so a report that
+    overtook a newer one cannot regress the topology.
     """
 
     def __init__(self) -> None:
         """Initialize an empty registry."""
         self._lock = threading.Lock()
         self._by_instance: dict[str, tuple[ModuleCapacity, ...]] = {}
-        self._revisions: dict[str, int] = {}
-
-    def declare(
-        self, instance_id: str, modules: Sequence[ModuleCapacity], revision: int = 0
-    ) -> None:
-        """Record ``instance_id``'s capacities from a registration.
-
-        Overwrites any stored revision: a registration means a (re)started
-        process, whose counter may have gone backwards.
-
-        Args:
-            instance_id: The declaring server's id. Non-empty.
-            modules: Its compartments. Empty means "declared nothing", which
-                reads back as unknown capacity rather than zero.
-            revision: The revision ``modules`` was taken at.
-
-        Raises:
-            ValueError: If ``instance_id`` is empty, or two entries share a
-                ``(tier, backend)``.
-        """
-        self._validate(instance_id, modules)
-        with self._lock:
-            self._by_instance[instance_id] = tuple(modules)
-            self._revisions[instance_id] = revision
+        self._stamps: dict[str, tuple[int, int]] = {}
 
     def update(
-        self, instance_id: str, modules: Sequence[ModuleCapacity], revision: int
+        self,
+        instance_id: str,
+        modules: Sequence[ModuleCapacity],
+        incarnation: int,
+        revision: int,
     ) -> bool:
         """Apply a capacity report unless it is older than what is stored.
+
+        Ordered on ``(incarnation, revision)``. Revision alone would not do:
+        it restarts with the process, so a restarted server's first report
+        would look older than its predecessor's last and be rejected for
+        good.
 
         Args:
             instance_id: The declaring server's id. Non-empty.
             modules: Its current compartments, replacing any prior set.
+                Empty means "declared nothing", which reads back as unknown
+                capacity rather than zero.
+            incarnation: The reporting process's incarnation.
             revision: The revision ``modules`` was taken at.
 
         Returns:
             ``True`` when applied, ``False`` when already superseded.
 
         Raises:
-            ValueError: If ``instance_id`` is empty, or two entries share a
+            ValueError: If ``instance_id`` is empty, ``incarnation`` or
+                ``revision`` is negative, or two entries share a
                 ``(tier, backend)``.
         """
         self._validate(instance_id, modules)
+        if incarnation < 0:
+            raise ValueError(f"incarnation must be >= 0 (got {incarnation})")
+        if revision < 0:
+            raise ValueError(f"revision must be >= 0 (got {revision})")
+        stamp = (incarnation, revision)
         with self._lock:
-            if revision <= self._revisions.get(instance_id, -1):
+            if stamp <= self._stamps.get(instance_id, (-1, -1)):
                 return False
             self._by_instance[instance_id] = tuple(modules)
-            self._revisions[instance_id] = revision
+            self._stamps[instance_id] = stamp
             return True
 
     @staticmethod
@@ -169,4 +168,4 @@ class ServerConfigRegistry:
         """
         with self._lock:
             self._by_instance.pop(instance_id, None)
-            self._revisions.pop(instance_id, None)
+            self._stamps.pop(instance_id, None)
