@@ -110,6 +110,8 @@ def create_app(config: MPCoordinatorConfig) -> FastAPI:
     # usage view for the same batch, so the usage view must consume first.
     event_broadcaster.register_consumer(usage_manager)
     event_broadcaster.register_consumer(eviction_controller)
+    # Consumes ``config`` batches only, so its position is free.
+    event_broadcaster.register_consumer(server_config)
     # Held by the ingest path; whoever captures durable state takes it
     # to read across the consumers consistently.
     quiesce = QuiesceLock()

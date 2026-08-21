@@ -30,11 +30,7 @@ from lmcache.v1.mp_coordinator.api import (
     CacheEventEntry,
     CacheEventType,
 )
-from lmcache.v1.mp_coordinator.schemas import (
-    CacheEventsRequest,
-    ModuleCapacityModel,
-    ServerCapacityReport,
-)
+from lmcache.v1.mp_coordinator.schemas import CacheEventsRequest
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import EventCallback, EventSubscriber
 
@@ -60,16 +56,11 @@ class CacheEventSink(ABC):
     """
 
     @abstractmethod
-    def publish(
-        self,
-        batches: list[CacheEventBatch],
-        capacity_reports: list[ServerCapacityReport],
-    ) -> None:
+    def publish(self, batches: list[CacheEventBatch]) -> None:
         """Deliver ``batches`` to the directory, in list order.
 
         Args:
             batches: The batches to deliver.
-            capacity_reports: Capacity declarations to apply, if any.
 
         Raises:
             CacheEventPublishError: If delivery failed. Retrying and
@@ -98,22 +89,17 @@ class HttpCacheEventSink(CacheEventSink):
         self._base_url = coordinator_url.rstrip("/")
         self._client = httpx.Client(timeout=timeout)
 
-    def publish(
-        self,
-        batches: list[CacheEventBatch],
-        capacity_reports: list[ServerCapacityReport],
-    ) -> None:
+    def publish(self, batches: list[CacheEventBatch]) -> None:
         """Deliver ``batches`` via one ``POST /events`` request.
 
         Args:
             batches: The batches to deliver.
-            capacity_reports: Capacity declarations to apply, if any.
 
         Raises:
             CacheEventPublishError: If the request failed or returned
                 a non-2xx status.
         """
-        body = CacheEventsRequest(batches=batches, capacity_reports=capacity_reports)
+        body = CacheEventsRequest(batches=batches)
         try:
             resp = self._client.post(
                 f"{self._base_url}/events",
@@ -200,9 +186,9 @@ class CacheEventSubscriber(EventSubscriber):
         # Consecutive same-identity entries append to the last pending
         # batch; an identity change starts a new one (order-preserving).
         self._pending_batches: list[_PendingBatch] = []
-        # At most one pending report: each is a whole declaration, so a
-        # newer one supersedes rather than queues behind an older.
-        self._pending_capacity: ServerCapacityReport | None = None
+        # At most one pending declaration: each is the whole topology, so
+        # a newer one supersedes rather than queues behind an older.
+        self._pending_capacity: CapacitySnapshot | None = None
         # Chunk hash → token content from token-binding events (published
         # ahead of the write-finished events), used to stamp STORE
         # entries. LRU-bounded; a miss stamps nothing.
@@ -238,11 +224,14 @@ class CacheEventSubscriber(EventSubscriber):
         capacity = self._pending_capacity
         self._pending_capacity = None
         ts = time.time()
-        batches = [
+        # Declaration first, so a flush that also carries placements gives
+        # the coordinator its denominator before the bytes it divides.
+        batches = self._capacity_batches(capacity, ts)
+        batches += [
             CacheEventBatch(
                 instance_id=self._instance_id,
                 incarnation=self._incarnation,
-                seq=self._seq + offset + 1,
+                seq=self._seq + len(batches) + offset + 1,
                 event_type=pending.event_type,
                 tier=pending.tier,
                 backend=pending.backend,
@@ -252,13 +241,12 @@ class CacheEventSubscriber(EventSubscriber):
             )
             for offset, pending in enumerate(pending_batches)
         ]
-        self._seq += len(pending_batches)
-        reports = [capacity] if capacity is not None else []
+        self._seq += len(batches)
         try:
-            self._sink.publish(batches, reports)
+            self._sink.publish(batches)
         except CacheEventPublishError as e:
-            # Batches are lost for good, but a capacity report is a whole
-            # declaration, so restore it for the next flush. A newer one
+            # Placement batches are lost for good, but a declaration is the
+            # whole topology, so restore it for the next flush. A newer one
             # arriving first just supersedes it.
             if capacity is not None and self._pending_capacity is None:
                 self._pending_capacity = capacity
@@ -268,6 +256,43 @@ class CacheEventSubscriber(EventSubscriber):
                 self._instance_id,
                 e,
             )
+
+    def _capacity_batches(
+        self, capacity: "CapacitySnapshot | None", ts: float
+    ) -> list[CacheEventBatch]:
+        """Expand one declaration into a ``config`` batch per compartment.
+
+        Every batch of one declaration carries the same
+        ``capacity_revision``, which is what lets the coordinator tell a
+        fresh declaration from a continuation and retire compartments the
+        new one omits.
+
+        Args:
+            capacity: The declaration to expand, or ``None`` for no
+                declaration this flush.
+            ts: Emitter wall-clock seconds to stamp the batches with.
+
+        Returns:
+            One batch per compartment, seq-numbered from the current
+            cursor; empty when there is nothing to declare.
+        """
+        if capacity is None:
+            return []
+        return [
+            CacheEventBatch(
+                instance_id=self._instance_id,
+                incarnation=self._incarnation,
+                seq=self._seq + offset + 1,
+                event_type=CacheEventType.CONFIG,
+                tier=module.tier,
+                backend=module.backend,
+                shared=module.shared,
+                ts=ts,
+                capacity_bytes=module.capacity_bytes,
+                capacity_revision=capacity.revision,
+            )
+            for offset, module in enumerate(capacity.modules)
+        ]
 
     def shutdown(self) -> None:
         """Flush buffered events and close the sink. Called by
@@ -280,20 +305,7 @@ class CacheEventSubscriber(EventSubscriber):
     def _on_capacity_changed(self, event: Event) -> None:
         """Hold the new declaration for the next flush."""
         snapshot: CapacitySnapshot = event.metadata["snapshot"]
-        self._pending_capacity = ServerCapacityReport(
-            instance_id=self._instance_id,
-            incarnation=self._incarnation,
-            revision=snapshot.revision,
-            modules=[
-                ModuleCapacityModel(
-                    tier=module.tier,
-                    backend=module.backend,
-                    capacity_bytes=module.capacity_bytes,
-                    shared=module.shared,
-                )
-                for module in snapshot.modules
-            ],
-        )
+        self._pending_capacity = snapshot
         self._flush_if_due()
 
     def _on_tick(self, event: Event) -> None:

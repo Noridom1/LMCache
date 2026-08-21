@@ -72,71 +72,6 @@ def decode_tokens(tokens_b64: str) -> np.ndarray:
     return np.frombuffer(raw, dtype="<u4").astype(np.uint64)
 
 
-# -- Server memory configuration ---------------------------------------------
-
-
-class ModuleCapacityModel(BaseModel):
-    """One compartment's declared capacity: the L1 pool or one L2 adapter.
-
-    Keyed on the same ``(tier, backend)`` axis cache events use.
-
-    Attributes:
-        tier: ``l1`` or ``l2``; ``all`` is rejected.
-        backend: Backend within the tier (``"dram"``, ``"s3"``, ...).
-            Non-empty.
-        capacity_bytes: Declared capacity. ``0`` means undeclared --
-            reported as unknown, not as full.
-        shared: Set when instances mount this pool, so its capacity must
-            not be summed.
-    """
-
-    tier: Tier
-    backend: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
-    capacity_bytes: int = Field(default=0, ge=0)
-    shared: bool = False
-
-    @field_validator("tier")
-    @classmethod
-    def _reject_tier_all(cls, value: Tier) -> Tier:
-        """Reject ``Tier.ALL``, which names no single compartment.
-
-        Args:
-            value: The submitted tier.
-
-        Returns:
-            ``value``, unchanged.
-
-        Raises:
-            ValueError: If ``value`` is ``Tier.ALL``.
-        """
-        if value not in (Tier.L1, Tier.L2):
-            raise ValueError("tier must be 'l1' or 'l2'")
-        return value
-
-
-class ServerCapacityReport(BaseModel):
-    """One server's capacity declaration, sent when its topology changes.
-
-    Always a whole declaration, never a delta, so a dropped report is
-    repaired by the next instead of leaving the coordinator wrong.
-
-    Attributes:
-        instance_id: The declaring server. Non-empty.
-        incarnation: The emitting process's incarnation, as on
-            :class:`CacheEventBatch`. Orders reports across restarts, which
-            ``revision`` alone cannot since it restarts with the process.
-        revision: Monotonic counter within one incarnation. The coordinator
-            ignores a ``(incarnation, revision)`` it has already passed, so
-            out-of-order reports cannot regress the topology.
-        modules: The server's current compartments, replacing any prior set.
-    """
-
-    instance_id: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
-    incarnation: int = Field(ge=0)
-    revision: int = Field(ge=0)
-    modules: list[ModuleCapacityModel] = Field(default_factory=list)
-
-
 class RegisterRequest(BaseModel):
     """Body of a ``POST /instances`` registration request.
 
@@ -350,14 +285,11 @@ class CacheEventsRequest(BaseModel):
 
     Attributes:
         batches: Event batches to apply, in emission order per instance.
-        capacity_reports: Capacity declarations changed since the last
-            request. Carried alongside the batches rather than inside one:
-            a declaration has no object key, so it does not fit the batch
-            envelope.
+            Includes ``config`` batches, which declare capacity rather than
+            report placements.
     """
 
     batches: list[CacheEventBatch] = Field(default_factory=list)
-    capacity_reports: list[ServerCapacityReport] = Field(default_factory=list)
 
     @field_validator("batches")
     @classmethod

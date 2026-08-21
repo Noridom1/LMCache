@@ -15,7 +15,13 @@ import numpy as np
 import pytest
 
 # First Party
-from lmcache.v1.distributed.api import L1BackendType, ObjectKey, Tier
+from lmcache.v1.distributed.api import (
+    CapacitySnapshot,
+    L1BackendType,
+    ModuleMemoryCapacity,
+    ObjectKey,
+    Tier,
+)
 from lmcache.v1.distributed.internal_api import L1ObjectMeta
 from lmcache.v1.mp_coordinator.api import (
     UNKNOWN_TOKEN_OFFSET,
@@ -31,7 +37,6 @@ from lmcache.v1.mp_coordinator.cache_events import (
     HttpCacheEventSink,
 )
 from lmcache.v1.mp_coordinator.config import MPCoordinatorConfig
-from lmcache.v1.mp_coordinator.schemas import ServerCapacityReport
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import EventBus, EventBusConfig
 import lmcache.v1.mp_coordinator.cache_events as cache_events
@@ -58,20 +63,14 @@ class _RecordingSink(CacheEventSink):
 
     def __init__(self) -> None:
         self.published: list[list[CacheEventBatch]] = []
-        self.published_capacity: list[list[ServerCapacityReport]] = []
         self.fail_next = False
         self.closed = False
 
-    def publish(
-        self,
-        batches: list[CacheEventBatch],
-        capacity_reports: list[ServerCapacityReport],
-    ) -> None:
+    def publish(self, batches: list[CacheEventBatch]) -> None:
         if self.fail_next:
             self.fail_next = False
             raise CacheEventPublishError("injected failure")
         self.published.append(batches)
-        self.published_capacity.append(capacity_reports)
 
     def close(self) -> None:
         self.closed = True
@@ -814,5 +813,114 @@ def test_http_sink_raises_publish_error_on_http_failure():
         entries=[_entry(1, 100)],
     )
     with pytest.raises(CacheEventPublishError):
-        sink.publish([batch], [])
+        sink.publish([batch])
     sink.close()
+
+
+# -- Capacity declarations ----------------------------------------------------
+
+
+def _snapshot(revision: int, *modules: ModuleMemoryCapacity) -> CapacitySnapshot:
+    """A capacity snapshot as StorageManager publishes it."""
+    return CapacitySnapshot(revision=revision, modules=tuple(modules))
+
+
+def _capacity_event(snapshot: CapacitySnapshot) -> Event:
+    """The bus event StorageManager emits on a topology change."""
+    return Event(
+        event_type=EventType.SM_CAPACITY_CHANGED,
+        metadata={"snapshot": snapshot},
+    )
+
+
+def test_a_declaration_becomes_one_config_batch_per_compartment():
+    sink = _RecordingSink()
+    subscriber = _subscriber(sink)
+
+    _dispatch(
+        subscriber,
+        _capacity_event(
+            _snapshot(
+                3,
+                ModuleMemoryCapacity(Tier.L1, "dram", 40 * (1 << 30), False),
+                ModuleMemoryCapacity(Tier.L2, "s3", 0, True),
+            )
+        ),
+    )
+    subscriber.flush()
+
+    batches = sink.published[0]
+    assert [b.event_type for b in batches] == [CacheEventType.CONFIG] * 2
+    assert [(b.tier, b.backend, b.capacity_bytes, b.shared) for b in batches] == [
+        (Tier.L1, "dram", 40 * (1 << 30), False),
+        (Tier.L2, "s3", 0, True),
+    ]
+    # One declaration, so one revision -- that is what lets the coordinator
+    # tell a fresh declaration from a continuation.
+    assert {b.capacity_revision for b in batches} == {3}
+    # A declaration carries no placements.
+    assert all(b.entries == [] for b in batches)
+
+
+def test_config_batches_share_the_seq_space_with_placements():
+    # They ride the same stream, so a reused seq would be dropped as a
+    # duplicate by the gate.
+    sink = _RecordingSink()
+    subscriber = _subscriber(sink)
+
+    _dispatch(
+        subscriber,
+        _capacity_event(
+            _snapshot(1, ModuleMemoryCapacity(Tier.L1, "dram", 8 * (1 << 30), False))
+        ),
+        Event(
+            event_type=EventType.L1_WRITE_FINISHED,
+            metadata={"keys": [_key(1)], "meta": [_meta(100)]},
+        ),
+    )
+    subscriber.flush()
+
+    batches = sink.published[0]
+    assert [b.seq for b in batches] == [1, 2]
+    # Declaration first, so the denominator lands before the bytes.
+    assert batches[0].event_type == CacheEventType.CONFIG
+    assert batches[1].event_type == CacheEventType.STORE
+
+
+def test_a_newer_declaration_supersedes_an_unflushed_one():
+    sink = _RecordingSink()
+    subscriber = _subscriber(sink)
+
+    _dispatch(
+        subscriber,
+        _capacity_event(
+            _snapshot(1, ModuleMemoryCapacity(Tier.L1, "dram", 8 * (1 << 30), False))
+        ),
+        _capacity_event(
+            _snapshot(2, ModuleMemoryCapacity(Tier.L1, "dram", 16 * (1 << 30), False))
+        ),
+    )
+    subscriber.flush()
+
+    batches = sink.published[0]
+    assert [b.capacity_bytes for b in batches] == [16 * (1 << 30)]
+    assert batches[0].capacity_revision == 2
+
+
+def test_a_declaration_survives_a_publish_failure():
+    # The whole topology, so resending repairs it; a byte delta could not.
+    sink = _RecordingSink()
+    subscriber = _subscriber(sink)
+
+    _dispatch(
+        subscriber,
+        _capacity_event(
+            _snapshot(4, ModuleMemoryCapacity(Tier.L1, "dram", 8 * (1 << 30), False))
+        ),
+    )
+    sink.fail_next = True
+    subscriber.flush()
+    assert sink.published == []
+
+    subscriber.flush()
+    assert [b.capacity_revision for b in sink.published[0]] == [4]

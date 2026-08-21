@@ -1,25 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Per-MP-server memory capacity, as declared on the event stream.
+"""Per-MP-server memory capacity, declared by ``config`` cache events.
 
 Cache events report bytes held, never bytes holdable, so servers declare
-capacity separately and this registry stores it. Storage only -- no event
-handling, no pressure math, no liveness.
+capacity separately and this registry stores it. It is a
+:class:`~lmcache.v1.mp_coordinator.ingest.event_broadcaster.CacheEventConsumer`
+like the key directory and the usage manager, so declarations arrive through
+the same gate -- inheriting its incarnation fencing, dedup, and ordering
+instead of carrying a second mechanism alongside.
 
-Declarations arrive as capacity reports on the cache-event stream, fenced
-by ``(incarnation, revision)`` exactly as event batches are: incarnation
-orders process lifetimes, revision orders changes within one.
+One declaration is one ``config`` batch per compartment, all sharing a
+``capacity_revision``. A batch whose revision is newer than what is stored
+starts a fresh set; batches at the same revision extend it. That is what
+retires a compartment: a declaration that omits it simply never adds it.
 """
 
 # Future
 from __future__ import annotations
 
 # Standard
-from collections.abc import Sequence
 from dataclasses import dataclass
 import threading
 
 # First Party
+from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import Tier
+from lmcache.v1.mp_coordinator.api import CacheEventBatch, CacheEventType
+
+logger = init_logger(__name__)
 
 # "No cap declared". Real caps are positive, so an unlimited adapter
 # reporting 0 would otherwise read as permanently full.
@@ -66,78 +73,58 @@ class ModuleCapacity:
 class ServerConfigRegistry:
     """Thread-safe store of each MP server's declared capacities.
 
-    :meth:`update` replaces a declaration wholesale, so a dropped L2
-    adapter's capacity cannot linger, and is fenced so a report that
-    overtook a newer one cannot regress the topology.
+    A :class:`CacheEventConsumer`: :meth:`consume` accumulates ``config``
+    batches into one declaration per ``(incarnation, capacity_revision)``,
+    so a compartment the newest declaration omits stops being reported.
     """
 
     def __init__(self) -> None:
         """Initialize an empty registry."""
         self._lock = threading.Lock()
-        self._by_instance: dict[str, tuple[ModuleCapacity, ...]] = {}
+        self._by_instance: dict[str, dict[tuple[Tier, str], ModuleCapacity]] = {}
         self._stamps: dict[str, tuple[int, int]] = {}
 
-    def update(
-        self,
-        instance_id: str,
-        modules: Sequence[ModuleCapacity],
-        incarnation: int,
-        revision: int,
-    ) -> bool:
-        """Apply a capacity report unless it is older than what is stored.
+    def consume(self, batch: CacheEventBatch) -> None:
+        """Apply one ``config`` batch; ignore every other event type.
 
-        Ordered on ``(incarnation, revision)``. Revision alone would not do:
-        it restarts with the process, so a restarted server's first report
-        would look older than its predecessor's last and be rejected for
-        good.
+        The gate has already dropped stale incarnations and duplicates, so
+        the only ordering left to do is grouping batches into declarations:
+        a newer ``(incarnation, capacity_revision)`` starts a fresh set, an
+        equal one extends it, an older one is a straggler and is dropped.
 
         Args:
-            instance_id: The declaring server's id. Non-empty.
-            modules: Its current compartments, replacing any prior set.
-                Empty means "declared nothing", which reads back as unknown
-                capacity rather than zero.
-            incarnation: The reporting process's incarnation.
-            revision: The revision ``modules`` was taken at.
-
-        Returns:
-            ``True`` when applied, ``False`` when already superseded.
-
-        Raises:
-            ValueError: If ``instance_id`` is empty, ``incarnation`` or
-                ``revision`` is negative, or two entries share a
-                ``(tier, backend)``.
+            batch: A gate-admitted batch. Non-``config`` batches no-op.
         """
-        self._validate(instance_id, modules)
-        if incarnation < 0:
-            raise ValueError(f"incarnation must be >= 0 (got {incarnation})")
-        if revision < 0:
-            raise ValueError(f"revision must be >= 0 (got {revision})")
-        stamp = (incarnation, revision)
+        if batch.event_type != CacheEventType.CONFIG:
+            return
+        module = ModuleCapacity(
+            tier=batch.tier,
+            backend=batch.backend,
+            capacity_bytes=batch.capacity_bytes,
+            shared=batch.shared,
+        )
+        stamp = (batch.incarnation, batch.capacity_revision)
         with self._lock:
-            if stamp <= self._stamps.get(instance_id, (-1, -1)):
-                return False
-            self._by_instance[instance_id] = tuple(modules)
-            self._stamps[instance_id] = stamp
-            return True
+            stored = self._stamps.get(batch.instance_id, (-1, -1))
+            if stamp < stored:
+                return
+            if stamp > stored:
+                # A new declaration: drop the previous set so compartments
+                # it no longer lists stop being reported.
+                self._by_instance[batch.instance_id] = {}
+                self._stamps[batch.instance_id] = stamp
+            self._by_instance[batch.instance_id][(module.tier, module.backend)] = module
 
-    @staticmethod
-    def _validate(instance_id: str, modules: Sequence[ModuleCapacity]) -> None:
-        """Reject an empty id, or two entries for one compartment.
+    def fence_instance(self, instance_id: str) -> None:
+        """No-op: capacity is configuration, not reported L1 state.
 
-        Raises:
-            ValueError: On either.
+        A restarting process re-declares under a higher incarnation, which
+        :meth:`consume` supersedes on its own. A departing one has its
+        declaration dropped by :meth:`forget`.
+
+        Args:
+            instance_id: The instance whose reported L1 state is void.
         """
-        if not instance_id:
-            raise ValueError("instance_id must be non-empty")
-        seen: set[tuple[Tier, str]] = set()
-        for module in modules:
-            identity = (module.tier, module.backend)
-            if identity in seen:
-                raise ValueError(
-                    f"duplicate capacity declaration for "
-                    f"{module.tier.value}/{module.backend}"
-                )
-            seen.add(identity)
 
     def get(self, instance_id: str) -> tuple[ModuleCapacity, ...]:
         """Return ``instance_id``'s declared compartments.
@@ -149,7 +136,7 @@ class ServerConfigRegistry:
             Its declarations; empty when unknown or nothing was declared.
         """
         with self._lock:
-            return self._by_instance.get(instance_id, ())
+            return tuple(self._by_instance.get(instance_id, {}).values())
 
     def get_all(self) -> dict[str, tuple[ModuleCapacity, ...]]:
         """Return a snapshot of every server's declarations.
@@ -158,7 +145,10 @@ class ServerConfigRegistry:
             A copy mapping ``instance_id`` to its compartments.
         """
         with self._lock:
-            return dict(self._by_instance)
+            return {
+                instance_id: tuple(modules.values())
+                for instance_id, modules in self._by_instance.items()
+            }
 
     def forget(self, instance_id: str) -> None:
         """Drop ``instance_id``'s declaration. Idempotent.

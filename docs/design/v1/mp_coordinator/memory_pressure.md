@@ -25,8 +25,10 @@ needs. This capability adds only the denominator.
 
 ## How capacity reaches the coordinator
 
-One writer: `capacity_reports` on `POST /events`, replacing a server's
-declaration wholesale.
+Capacity is a **`config` cache event**, so it travels the one ingest path
+every other event does and the registry is a `CacheEventConsumer` like the
+key directory and the usage manager. One declaration is one `config` batch
+per compartment, all sharing a `capacity_revision`.
 
 `StorageManager` publishes `SM_CAPACITY_CHANGED` on the observability bus and
 the cache-event subscriber ships it on its next flush. It fires:
@@ -43,38 +45,50 @@ the cache-event subscriber ships it on its next flush. It fires:
 
 Registration deliberately carries no capacity in its *body*. One path means
 the coordinator cannot hold a declaration that disagrees with the event
-stream, and it closes
-a real hole: registration and event reporting are separately configurable, so
-a server registering without event reporting used to declare capacity whose
-usage never arrived, making every compartment read as a confident `0.0`
-instead of unknown.
+stream, and it closes a real hole: registration and event reporting are
+separately configurable, so a server registering without event reporting used
+to declare capacity whose usage never arrived, making every compartment read
+as a confident `0.0` instead of unknown.
 
-A report carries the **whole declaration**, never a delta. That is what makes
-the lossy event channel acceptable here: a dropped report is repaired by the
-next one, where a dropped byte delta would be permanent. The emitter also
-keeps an unsent report across a publish failure, so a transient outage does
-not lose it.
+A declaration is always the **whole topology**, never a delta. That is what
+makes the lossy channel acceptable: a dropped batch is repaired by the next
+declaration, where a dropped byte delta would be permanent. The emitter also
+keeps an unsent declaration across a publish failure.
 
-Reports are ordered on `(incarnation, revision)`, the same fencing the event
-batches use. Revision alone would not do: it restarts with the process, so a
-restarted server's first report would look older than its predecessor's last
-and be rejected for good. The registry ignores a stamp it has already passed —
-otherwise two reconfigures racing could let an older full declaration
-overwrite a newer topology.
+`(incarnation, capacity_revision)` groups batches into declarations. A newer
+stamp starts a fresh set, an equal one extends it, an older one is dropped.
+**That is what retires a compartment**: a declaration omitting it simply
+never re-adds it, which is how a deleted L2 adapter stops being reported.
+Incarnation fencing and seq dedup come from the gate, so nothing here
+duplicates them.
 
-Capacity does not ride the batch envelope itself: `CacheEventBatch` requires
-a non-empty `backend`, rejects `Tier.ALL`, and every entry needs an
-`ObjectKey`. A declaration has no key, so it travels as a sibling field on
-the same request — sharing the connection and flush tick without contorting
-the entry shape.
+Two consequences worth knowing:
 
-## Why capacity is not a cache event
+- `config` batches share the seq space with placements, so the emitter's one
+  counter covers both and a reused seq is dropped as a duplicate.
+- The registry cannot reject a compartment declared twice inside one
+  declaration — it never sees the whole list — so it upserts and the last
+  batch wins. `_build_capacities` derives one entry per medium and adapter,
+  so a correct producer cannot do it.
+
+The batch envelope carries a declaration on `tier`, `backend`, `shared`,
+plus `capacity_bytes` and `capacity_revision`; `entries` is required empty.
+That empty-entries invariant is what makes the other consumers safe: the key
+directory, usage manager, and eviction controller are all entries-driven, so
+a `config` batch is a no-op for each without any of them knowing the type
+exists.
+
+## Why capacity is its own event type
 
 Capacity is configuration: it changes when a server boots and when it is
-reconfigured, not once per cache operation. Emitting it per operation would
-republish an unchanging number thousands of times a second, and it would
-carry no `ObjectKey` for the gate's dedup and fencing to work on. Emitting it
-on change keeps the volume proportional to what actually varies.
+reconfigured, not once per cache operation. Reusing `store` would mean
+inventing a placement for something that has no key; emitting it per
+operation would republish an unchanging number thousands of times a second.
+A distinct type emitted on change keeps the volume proportional to what
+actually varies and leaves the placement types untouched.
+
+The cost is two fields on `CacheEventBatch` that only `config` reads, so
+every placement batch carries them as zeros on the wire.
 
 ## Architecture
 
@@ -87,10 +101,10 @@ StorageManager.publish_capacity()
   L2: per adapter, total_capacity_bytes
       + shared flag from its config
         │
-        │  subscriber: ModuleMemoryCapacity → ModuleCapacityModel
+        │  subscriber: ModuleMemoryCapacity → config CacheEventBatch
         ▼
-  POST /events ─────────────────────▶  ServerConfigRegistry.update()
-   (capacity_reports)                    replaces the prior set wholesale
+  POST /events ─────────▶ EventGate ─▶  ServerConfigRegistry.consume()
+   (config batches)                       one set per (incarnation, revision)
                                                     │
 L2 adapter / L1 manager publish                     │  capacity
   l1.* / l2.* on the event bus                      │

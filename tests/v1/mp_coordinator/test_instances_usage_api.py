@@ -25,11 +25,26 @@ GIB = 1 << 30
 
 @pytest.fixture
 def client() -> TestClient:
-    """A coordinator with both background loops disabled."""
+    """A coordinator with both background loops disabled.
+
+    Carries a per-instance seq allocator: ``config`` batches share the seq
+    space with placement batches, so reusing a number gets the second batch
+    dropped as a duplicate.
+    """
     app = create_app(
         MPCoordinatorConfig(health_check_interval=0, eviction_check_interval=0)
     )
-    return TestClient(app)
+    test_client = TestClient(app)
+    test_client.seqs = {}  # type: ignore[attr-defined]
+    return test_client
+
+
+def _take_seqs(client: TestClient, instance_id: str, count: int) -> int:
+    """Reserve ``count`` consecutive seq numbers and return the first."""
+    seqs: dict[str, int] = client.seqs  # type: ignore[attr-defined]
+    first = seqs.get(instance_id, 0) + 1
+    seqs[instance_id] = first + count - 1
+    return first
 
 
 def _ctx(client: TestClient) -> CoordinatorContext:
@@ -46,6 +61,31 @@ def _ctx(client: TestClient) -> CoordinatorContext:
     return cast("FastAPI", client.app).state.ctx
 
 
+def _config_batches(
+    instance_id: str,
+    modules: list[dict[str, object]],
+    incarnation: int,
+    revision: int,
+    first_seq: int,
+) -> list[dict[str, object]]:
+    """One ``config`` batch per compartment, all at the same revision."""
+    return [
+        {
+            "instance_id": instance_id,
+            "incarnation": incarnation,
+            "seq": first_seq + offset,
+            "event_type": "config",
+            "tier": module["tier"],
+            "backend": module["backend"],
+            "shared": module.get("shared", False),
+            "entries": [],
+            "capacity_bytes": module.get("capacity_bytes", 0),
+            "capacity_revision": revision,
+        }
+        for offset, module in enumerate(modules)
+    ]
+
+
 def _declare(
     client: TestClient,
     instance_id: str,
@@ -53,19 +93,14 @@ def _declare(
     incarnation: int = 1,
     revision: int = 1,
 ) -> None:
-    """Declare ``modules`` as a capacity report on the event stream."""
+    """Declare ``modules`` as ``config`` batches on the event stream."""
+    first_seq = _take_seqs(client, instance_id, max(len(modules), 1))
     response = client.post(
         "/events",
         json={
-            "batches": [],
-            "capacity_reports": [
-                {
-                    "instance_id": instance_id,
-                    "incarnation": incarnation,
-                    "revision": revision,
-                    "modules": modules,
-                }
-            ],
+            "batches": _config_batches(
+                instance_id, modules, incarnation, revision, first_seq
+            )
         },
     )
     assert response.status_code == 200, response.text
@@ -102,9 +137,9 @@ def _ingest(
     size_bytes: int,
     index: int,
     shared: bool = False,
-    seq: int = 1,
 ) -> None:
     """Push one STORE batch through the ingest gate."""
+    seq = _take_seqs(client, instance_id, 1)
     key = ObjectKey(
         chunk_hash=bytes([index]) * 32,
         model_name="model",
@@ -246,7 +281,7 @@ class TestFleetMemory:
         _register(client, "mp-1", [shared])
         _register(client, "mp-2", [shared])
         _ingest(client, "mp-1", Tier.L2, "s3", 25 * GIB, index=1, shared=True)
-        _ingest(client, "mp-2", Tier.L2, "s3", 25 * GIB, index=1, shared=True, seq=1)
+        _ingest(client, "mp-2", Tier.L2, "s3", 25 * GIB, index=1, shared=True)
 
         body = client.get("/instances/usage").json()
         assert len(body["shared_modules"]) == 1
@@ -332,122 +367,99 @@ class TestRegistration:
         response = client.post(
             "/events",
             json={
-                "batches": [],
-                "capacity_reports": [
-                    {
-                        "instance_id": "mp-1",
-                        "incarnation": 1,
-                        "revision": 1,
-                        "modules": [
-                            {"tier": "all", "backend": "dram", "capacity_bytes": GIB}
-                        ],
-                    }
-                ],
+                "batches": _config_batches(
+                    "mp-1",
+                    [{"tier": "all", "backend": "dram", "capacity_bytes": GIB}],
+                    incarnation=1,
+                    revision=1,
+                    first_seq=1,
+                )
             },
         )
         assert response.status_code == 422
 
-    def test_duplicate_compartment_is_rejected(self, client: TestClient) -> None:
-        with pytest.raises(ValueError, match="duplicate capacity declaration"):
-            _declare(
-                client,
-                "mp-1",
-                [
-                    {"tier": "l1", "backend": "dram", "capacity_bytes": GIB},
-                    {"tier": "l1", "backend": "dram", "capacity_bytes": 2 * GIB},
-                ],
-            )
-
-
-class TestCapacityReports:
-    """Capacity updates arriving on the event stream, not at registration."""
-
-    def _report(
-        self,
-        instance_id: str,
-        revision: int,
-        capacity_bytes: int,
-        incarnation: int = 1,
-    ) -> dict[str, object]:
-        """Build one capacity-report body."""
-        return {
-            "instance_id": instance_id,
-            "incarnation": incarnation,
-            "revision": revision,
-            "modules": [
-                {"tier": "l1", "backend": "dram", "capacity_bytes": capacity_bytes}
+    def test_repeated_compartment_in_one_declaration_takes_the_last(
+        self, client: TestClient
+    ) -> None:
+        # Per-compartment batches means the registry never sees the whole
+        # list, so it cannot reject a duplicate the way a single whole-list
+        # report could. It upserts, and the last batch wins. The emitter
+        # derives one entry per medium and adapter, so this is unreachable
+        # from a correct producer.
+        _register(client, "mp-1", [])
+        _declare(
+            client,
+            "mp-1",
+            [
+                {"tier": "l1", "backend": "dram", "capacity_bytes": GIB},
+                {"tier": "l1", "backend": "dram", "capacity_bytes": 2 * GIB},
             ],
-        }
-
-    def _post(self, client: TestClient, *reports: dict[str, object]) -> None:
-        """Send capacity reports through ``POST /events``."""
-        response = client.post(
-            "/events", json={"batches": [], "capacity_reports": list(reports)}
+            revision=2,
         )
-        assert response.status_code == 200, response.text
+        module = _module(client.get("/instances/mp-1/usage").json(), "l1", "dram")
+        assert module["capacity_bytes"] == 2 * GIB
+
+
+class TestCapacityDeclarations:
+    """``config`` batches accumulate into declarations, fenced by the gate."""
 
     def _capacity(self, client: TestClient, instance_id: str) -> int:
         """Read back one instance's declared L1 capacity."""
         body = client.get(f"/instances/{instance_id}/usage").json()
         return _module(body, "l1", "dram")["capacity_bytes"]
 
-    def test_a_later_report_supersedes_the_declared_capacity(
+    def _l1(self, capacity_bytes: int) -> list[dict[str, object]]:
+        """One L1/dram compartment at ``capacity_bytes``."""
+        return [{"tier": "l1", "backend": "dram", "capacity_bytes": capacity_bytes}]
+
+    def test_a_later_declaration_supersedes_the_earlier_one(
         self, client: TestClient
     ) -> None:
-        _register(
-            client,
-            "mp-1",
-            [{"tier": "l1", "backend": "dram", "capacity_bytes": 40 * GIB}],
-        )
+        _register(client, "mp-1", self._l1(40 * GIB))
         _ingest(client, "mp-1", Tier.L1, "dram", 10 * GIB, index=1)
         assert _module(client.get("/instances/mp-1/usage").json(), "l1", "dram")[
             "usage_ratio"
         ] == pytest.approx(0.25)
 
         # A device was added at runtime: same server, bigger pool.
-        self._post(client, self._report("mp-1", 2, 80 * GIB))
+        _declare(client, "mp-1", self._l1(80 * GIB), revision=2)
         assert _module(client.get("/instances/mp-1/usage").json(), "l1", "dram")[
             "usage_ratio"
         ] == pytest.approx(0.125)
 
-    def test_stale_report_cannot_regress_the_topology(self, client: TestClient) -> None:
-        # Reports are whole declarations, so an out-of-order one would
-        # otherwise overwrite a newer topology.
+    def test_a_stale_revision_cannot_regress_the_topology(
+        self, client: TestClient
+    ) -> None:
         _register(client, "mp-1", [])
-        self._post(client, self._report("mp-1", 5, 80 * GIB))
-        self._post(client, self._report("mp-1", 3, 10 * GIB))
+        _declare(client, "mp-1", self._l1(80 * GIB), revision=5)
+        _declare(client, "mp-1", self._l1(10 * GIB), revision=3)
         assert self._capacity(client, "mp-1") == 80 * GIB
 
-    def test_same_revision_is_ignored(self, client: TestClient) -> None:
-        _register(client, "mp-1", [])
-        self._post(client, self._report("mp-1", 2, 80 * GIB))
-        self._post(client, self._report("mp-1", 2, 10 * GIB))
-        assert self._capacity(client, "mp-1") == 80 * GIB
-
-    def test_a_new_incarnation_supersedes_a_higher_revision(
+    def test_the_same_revision_extends_the_declaration(
         self, client: TestClient
     ) -> None:
-        # A restarted server's revision counter goes back to 1. Without
-        # incarnation in the order, every report it ever sends would look
-        # stale and its capacity would never be learned again.
+        # One declaration is several batches sharing a revision, so an equal
+        # revision adds a compartment rather than being ignored. This is how
+        # a multi-compartment server declares at all.
         _register(client, "mp-1", [])
-        self._post(client, self._report("mp-1", 9, 80 * GIB, incarnation=1))
-        self._post(client, self._report("mp-1", 1, 16 * GIB, incarnation=2))
-        assert self._capacity(client, "mp-1") == 16 * GIB
+        _declare(client, "mp-1", self._l1(40 * GIB), revision=1)
+        _declare(
+            client,
+            "mp-1",
+            [{"tier": "l2", "backend": "fs", "capacity_bytes": 90 * GIB}],
+            revision=1,
+        )
+        backends = {
+            (m["tier"], m["backend"])
+            for m in client.get("/instances/mp-1/usage").json()["modules"]
+        }
+        assert backends == {("l1", "dram"), ("l2", "fs")}
 
-    def test_an_older_incarnation_cannot_win_on_revision(
+    def test_a_new_declaration_retires_compartments_it_omits(
         self, client: TestClient
     ) -> None:
-        # The reverse: a straggler from the previous process must lose even
-        # though its revision is far ahead.
-        _register(client, "mp-1", [])
-        self._post(client, self._report("mp-1", 1, 16 * GIB, incarnation=2))
-        self._post(client, self._report("mp-1", 99, 80 * GIB, incarnation=1))
-        assert self._capacity(client, "mp-1") == 16 * GIB
-
-    def test_report_replaces_wholesale_so_dropped_modules_vanish(
-        self, client: TestClient
-    ) -> None:
+        # The replacement for wholesale replacement: a dropped adapter is
+        # simply absent from the next revision, so it stops being reported.
         _register(
             client,
             "mp-1",
@@ -456,17 +468,39 @@ class TestCapacityReports:
                 {"tier": "l2", "backend": "fs", "capacity_bytes": 90 * GIB},
             ],
         )
-        self._post(client, self._report("mp-1", 2, 40 * GIB))
+        _declare(client, "mp-1", self._l1(40 * GIB), revision=2)
         backends = {
             (m["tier"], m["backend"])
             for m in client.get("/instances/mp-1/usage").json()["modules"]
         }
         assert backends == {("l1", "dram")}
 
-    def test_events_and_reports_ride_the_same_request(self, client: TestClient) -> None:
+    def test_a_new_incarnation_supersedes_a_higher_revision(
+        self, client: TestClient
+    ) -> None:
+        # A restarted server's revision counter goes back to 1. Without
+        # incarnation in the order, every report it ever sends would look
+        # stale and its capacity would never be learned again.
         _register(client, "mp-1", [])
+        _declare(client, "mp-1", self._l1(80 * GIB), incarnation=1, revision=9)
+        _declare(client, "mp-1", self._l1(16 * GIB), incarnation=2, revision=1)
+        assert self._capacity(client, "mp-1") == 16 * GIB
+
+    def test_an_older_incarnation_is_dropped_by_the_gate(
+        self, client: TestClient
+    ) -> None:
+        # The reverse, and now the gate's job rather than the registry's: a
+        # straggler from the previous process is fenced before it arrives.
+        _register(client, "mp-1", [])
+        _declare(client, "mp-1", self._l1(16 * GIB), incarnation=2, revision=1)
+        _declare(client, "mp-1", self._l1(80 * GIB), incarnation=1, revision=99)
+        assert self._capacity(client, "mp-1") == 16 * GIB
+
+    def test_config_and_placement_batches_ride_the_same_request(
+        self, client: TestClient
+    ) -> None:
+        _register(client, "mp-1", self._l1(40 * GIB))
         _ingest(client, "mp-1", Tier.L1, "dram", 20 * GIB, index=1)
-        self._post(client, self._report("mp-1", 1, 40 * GIB))
         module = _module(client.get("/instances/mp-1/usage").json(), "l1", "dram")
         assert module["used_bytes"] == 20 * GIB
         assert module["usage_ratio"] == pytest.approx(0.5)

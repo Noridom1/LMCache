@@ -14,7 +14,6 @@ from fastapi import APIRouter, Request
 from lmcache.v1.mp_coordinator.http_apis.dependencies import get_context
 from lmcache.v1.mp_coordinator.ingest.event_gate import IngestResult
 from lmcache.v1.mp_coordinator.schemas import CacheEventsRequest, CacheEventsResponse
-from lmcache.v1.mp_coordinator.server_config import ModuleCapacity
 
 router = APIRouter()
 
@@ -29,33 +28,16 @@ async def report_cache_events(
     emission order. Duplicates and stale incarnations are dropped and
     counted, not errors.
 
-    Any capacity reports are applied first: they are whole declarations
-    guarded by a revision, so a superseded one is ignored rather than
-    regressing the topology.
+    ``config`` batches ride the same path and reach the server-config
+    registry as a consumer, so they inherit the gate's fencing and ordering.
 
     Args:
-        body: The event batches and capacity reports to ingest.
+        body: The event batches to ingest.
 
     Returns:
         Counts of applied and dropped batches.
     """
-    ctx = get_context(request)
-    for report in body.capacity_reports:
-        ctx.server_config.update(
-            report.instance_id,
-            [
-                ModuleCapacity(
-                    tier=m.tier,
-                    backend=m.backend,
-                    capacity_bytes=m.capacity_bytes,
-                    shared=m.shared,
-                )
-                for m in report.modules
-            ],
-            report.incarnation,
-            report.revision,
-        )
-    event_gate = ctx.event_gate
+    event_gate = get_context(request).event_gate
     response = CacheEventsResponse()
     for batch in body.batches:
         result = event_gate.ingest(batch)

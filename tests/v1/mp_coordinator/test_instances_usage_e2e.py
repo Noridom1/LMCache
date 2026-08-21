@@ -9,6 +9,7 @@ one.
 """
 
 # Standard
+from typing import cast
 import socket as _socket
 import threading
 import time
@@ -83,28 +84,36 @@ def _declare(
     modules: list[dict[str, object]],
     incarnation: int = 1,
     revision: int = 1,
+    first_seq: int = 1,
 ) -> None:
-    """Declare ``modules`` as a capacity report on the event stream."""
+    """Declare ``modules`` as ``config`` batches on the event stream."""
+    batches = [
+        CacheEventBatch(
+            instance_id=instance_id,
+            incarnation=incarnation,
+            seq=first_seq + offset,
+            event_type=CacheEventType.CONFIG,
+            tier=Tier(module["tier"]),
+            backend=str(module["backend"]),
+            shared=bool(module.get("shared", False)),
+            capacity_bytes=cast("int", module.get("capacity_bytes", 0)),
+            capacity_revision=revision,
+        )
+        for offset, module in enumerate(modules)
+    ]
+    body = CacheEventsRequest(batches=batches)
     response = requests.post(
-        f"{base}/events",
-        json={
-            "batches": [],
-            "capacity_reports": [
-                {
-                    "instance_id": instance_id,
-                    "incarnation": incarnation,
-                    "revision": revision,
-                    "modules": modules,
-                }
-            ],
-        },
-        timeout=2,
+        f"{base}/events", json=body.model_dump(mode="json"), timeout=2
     )
     assert response.status_code == 200, response.text
 
 
 def _register(base: str, instance_id: str, modules: list[dict[str, object]]) -> None:
-    """Register an mp server, then declare ``modules`` over the event stream."""
+    """Register an mp server, then declare ``modules`` over the event stream.
+
+    The declaration consumes ``len(modules)`` seq numbers, so callers that
+    also publish placements start those at ``len(modules) + 1``.
+    """
     response = requests.post(
         f"{base}/instances",
         json={
@@ -196,9 +205,10 @@ def test_usage_and_capacity_join_over_real_http(coordinator) -> None:
         [{"tier": "l1", "backend": "dram", "capacity_bytes": 80 * GIB}],
     )
 
-    _publish(coordinator, "mp-1", Tier.L1, "dram", 10 * GIB, index=1, seq=1)
-    _publish(coordinator, "mp-1", Tier.L2, "fs", 50 * GIB, index=2, seq=2)
-    _publish(coordinator, "mp-2", Tier.L1, "dram", 60 * GIB, index=3, seq=1)
+    # Placement seqs continue past the config batches the declaration used.
+    _publish(coordinator, "mp-1", Tier.L1, "dram", 10 * GIB, index=1, seq=3)
+    _publish(coordinator, "mp-1", Tier.L2, "fs", 50 * GIB, index=2, seq=4)
+    _publish(coordinator, "mp-2", Tier.L1, "dram", 60 * GIB, index=3, seq=2)
 
     fleet = requests.get(f"{coordinator}/instances/usage", timeout=2).json()
     assert [i["instance_id"] for i in fleet["instances"]] == ["mp-1", "mp-2"]
@@ -247,9 +257,10 @@ def test_shared_pool_counted_once_across_mounts_over_real_http(coordinator) -> N
     _register(coordinator, "mp-1", [shared])
     _register(coordinator, "mp-2", [shared])
 
-    # Both servers report the same shared placement.
-    _publish(coordinator, "mp-1", Tier.L2, "s3", 25 * GIB, index=1, shared=True)
-    _publish(coordinator, "mp-2", Tier.L2, "s3", 25 * GIB, index=1, shared=True)
+    # Both servers report the same shared placement, at a seq past the
+    # config batch each declaration consumed.
+    _publish(coordinator, "mp-1", Tier.L2, "s3", 25 * GIB, index=1, shared=True, seq=2)
+    _publish(coordinator, "mp-2", Tier.L2, "s3", 25 * GIB, index=1, shared=True, seq=2)
 
     fleet = requests.get(f"{coordinator}/instances/usage", timeout=2).json()
     assert len(fleet["shared_modules"]) == 1
@@ -272,10 +283,10 @@ def test_restart_fences_l1_but_keeps_l2_over_real_http(coordinator) -> None:
         ],
     )
     _publish(
-        coordinator, "mp-1", Tier.L1, "dram", 10 * GIB, index=1, seq=1, incarnation=1
+        coordinator, "mp-1", Tier.L1, "dram", 10 * GIB, index=1, seq=3, incarnation=1
     )
     _publish(
-        coordinator, "mp-1", Tier.L2, "fs", 50 * GIB, index=2, seq=2, incarnation=1
+        coordinator, "mp-1", Tier.L2, "fs", 50 * GIB, index=2, seq=4, incarnation=1
     )
 
     before = requests.get(f"{coordinator}/instances/mp-1/usage", timeout=2).json()
@@ -298,7 +309,7 @@ def test_delete_releases_bytes_over_real_http(coordinator) -> None:
         "mp-1",
         [{"tier": "l1", "backend": "dram", "capacity_bytes": 40 * GIB}],
     )
-    _publish(coordinator, "mp-1", Tier.L1, "dram", 10 * GIB, index=1, seq=1)
+    _publish(coordinator, "mp-1", Tier.L1, "dram", 10 * GIB, index=1, seq=2)
     _publish(
         coordinator,
         "mp-1",
@@ -306,7 +317,7 @@ def test_delete_releases_bytes_over_real_http(coordinator) -> None:
         "dram",
         0,
         index=1,
-        seq=2,
+        seq=3,
         event_type=CacheEventType.DELETE,
     )
 
@@ -326,50 +337,61 @@ def test_unknown_instance_is_404_over_real_http(coordinator) -> None:
 def test_producer_declaration_yields_real_ratios_over_real_http(coordinator) -> None:
     """What an MP server declares is what the coordinator can join against.
 
-    Drift between the producer's compartment identity and the event stream's
-    ``(tier, backend)`` surfaces here as a missing ratio.
+    Drives the real producer path: a ``StorageManager`` capacity snapshot
+    through ``CacheEventSubscriber``, whose ``config`` batches are POSTed
+    verbatim. Drift between the producer's compartment identity and the
+    event stream's ``(tier, backend)`` surfaces here as a missing ratio.
     """
     # First Party
-    from lmcache.v1.distributed.api import ModuleMemoryCapacity
-    from lmcache.v1.mp_coordinator.schemas import (
-        ModuleCapacityModel,
-        ServerCapacityReport,
+    from lmcache.v1.distributed.api import CapacitySnapshot, ModuleMemoryCapacity
+    from lmcache.v1.mp_coordinator.cache_events import (
+        CacheEventSink,
+        CacheEventSubscriber,
     )
+    from lmcache.v1.mp_observability.event import Event, EventType
 
     # Shape _build_capacities() returns for a hybrid Device-DAX server.
-    produced = [
+    produced = (
         ModuleMemoryCapacity(Tier.L1, "devdax", 100 * GIB, False),
         ModuleMemoryCapacity(Tier.L1, "dram", 10 * GIB, False),
         ModuleMemoryCapacity(Tier.L2, "fs", 200 * GIB, False),
         ModuleMemoryCapacity(Tier.L2, "s3", 0, True),
-    ]
+    )
     _register(coordinator, "mp-1", [])
-    report = ServerCapacityReport(
+
+    captured: list[CacheEventBatch] = []
+
+    class _CapturingSink(CacheEventSink):
+        def publish(self, batches: list[CacheEventBatch]) -> None:
+            captured.extend(batches)
+
+    subscriber = CacheEventSubscriber(
+        sink=_CapturingSink(),
         instance_id="mp-1",
         incarnation=1,
-        revision=1,
-        modules=[
-            ModuleCapacityModel(
-                tier=c.tier,
-                backend=c.backend,
-                capacity_bytes=c.capacity_bytes,
-                shared=c.shared,
-            )
-            for c in produced
-        ],
+        flush_interval=0.0,
     )
+    subscriber.get_subscriptions()[EventType.SM_CAPACITY_CHANGED](
+        Event(
+            event_type=EventType.SM_CAPACITY_CHANGED,
+            metadata={"snapshot": CapacitySnapshot(revision=1, modules=produced)},
+        )
+    )
+    subscriber.flush()
+    assert len(captured) == len(produced), captured
+
     response = requests.post(
         f"{coordinator}/events",
-        json={"batches": [], "capacity_reports": [report.model_dump(mode="json")]},
+        json=CacheEventsRequest(batches=captured).model_dump(mode="json"),
         timeout=2,
     )
     assert response.status_code == 200, response.text
 
     # Usage arrives on the event stream.
-    _publish(coordinator, "mp-1", Tier.L1, "devdax", 25 * GIB, index=1, seq=1)
-    _publish(coordinator, "mp-1", Tier.L1, "dram", 5 * GIB, index=2, seq=2)
-    _publish(coordinator, "mp-1", Tier.L2, "fs", 50 * GIB, index=3, seq=3)
-    _publish(coordinator, "mp-1", Tier.L2, "s3", 9 * GIB, index=4, seq=4, shared=True)
+    _publish(coordinator, "mp-1", Tier.L1, "devdax", 25 * GIB, index=1, seq=5)
+    _publish(coordinator, "mp-1", Tier.L1, "dram", 5 * GIB, index=2, seq=6)
+    _publish(coordinator, "mp-1", Tier.L2, "fs", 50 * GIB, index=3, seq=7)
+    _publish(coordinator, "mp-1", Tier.L2, "s3", 9 * GIB, index=4, seq=8, shared=True)
 
     status = requests.get(f"{coordinator}/instances/mp-1/usage", timeout=2).json()
     assert status["declared_capacity"] is True
