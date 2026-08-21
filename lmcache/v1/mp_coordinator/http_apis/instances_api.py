@@ -99,6 +99,11 @@ async def deregister_instance(instance_id: str, request: Request) -> Response:
         logger.info("Deregistered instance %s", instance_id)
     else:
         logger.info("Instance %s not registered, skipping deregistration", instance_id)
+    # A departing process takes its L1 pool with it, so its reported L1
+    # bytes are void. Only the stale-eviction loop fenced them before, and
+    # it never sees an instance that left cleanly -- deregistration already
+    # removed it from the registry, so its bytes lingered for good.
+    ctx.event_gate.drop_instance(instance_id)
     # Dropped with the membership, or declarations grow without bound
     # across a churning fleet. Surviving L2 bytes lose their ratio.
     ctx.server_config.forget(instance_id)

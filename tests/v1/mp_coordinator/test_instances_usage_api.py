@@ -491,3 +491,44 @@ class TestRouting:
         # collection route cannot shadow it even for this id.
         _register(client, "usage", [])
         assert client.get("/instances/usage/usage").json()["instance_id"] == "usage"
+
+
+class TestDeparture:
+    """A departing process takes its L1 pool with it."""
+
+    def test_deregistration_fences_l1_bytes(self, client: TestClient) -> None:
+        # Only the stale-eviction loop used to fence, and it never sees an
+        # instance that left cleanly -- so its L1 bytes lingered for good.
+        _register(
+            client,
+            "mp-1",
+            [{"tier": "l1", "backend": "dram", "capacity_bytes": 40 * GIB}],
+        )
+        _ingest(client, "mp-1", Tier.L1, "dram", 10 * GIB, index=1)
+        assert (
+            _module(client.get("/instances/mp-1/usage").json(), "l1", "dram")[
+                "used_bytes"
+            ]
+            == 10 * GIB
+        )
+
+        assert client.delete("/instances/mp-1").status_code == 204
+        assert client.get("/instances/mp-1/usage").status_code == 404
+
+    def test_deregistration_keeps_l2_bytes(self, client: TestClient) -> None:
+        # L2 outlives the reporter: it is storage the fleet shares, and
+        # leaves only through a DELETE event.
+        _register(
+            client,
+            "mp-1",
+            [{"tier": "l2", "backend": "fs", "capacity_bytes": 40 * GIB}],
+        )
+        _ingest(client, "mp-1", Tier.L2, "fs", 5 * GIB, index=1)
+        assert client.delete("/instances/mp-1").status_code == 204
+
+        body = client.get("/instances/mp-1/usage").json()
+        assert body["registered"] is False
+        assert body["declared_capacity"] is False
+        module = _module(body, "l2", "fs")
+        assert module["used_bytes"] == 5 * GIB
+        assert module["usage_ratio"] is None
