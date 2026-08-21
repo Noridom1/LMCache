@@ -7,7 +7,7 @@ each server on that same stream. Neither is a pressure reading on its own.
 
 Code: `lmcache/v1/mp_coordinator/controllers/usage_manager.py` (usage view),
 `lmcache/v1/mp_coordinator/server_config.py` (capacity registry),
-`lmcache/v1/mp_coordinator/http_apis/memory_api.py` (REST endpoints),
+`lmcache/v1/mp_coordinator/http_apis/instances_usage_api.py` (REST endpoints),
 `lmcache/v1/distributed/storage_manager.py` (MP-server capacity source),
 `lmcache/v1/mp_coordinator/cache_events.py` (MP-server declaration).
 
@@ -103,8 +103,8 @@ L2 adapter / L1 manager publish                     │  capacity
                                                   (instance, tier, backend) │
                                                                     usage   │
                                                                             ▼
-                                                       GET /memory  joins both
-                                                       GET /memory/{instance_id}
+                                              GET /instances/usage  joins both
+                                              GET /instances/{instance_id}/usage
 ```
 
 ## The compartment axis
@@ -148,7 +148,8 @@ result looks plausible, which is worse than an obvious error.
 The usage tracker follows the same convention the key directory and the
 per-salt view use: shared placements are keyed under an empty owner
 (`SHARED_OWNER`), so they are counted once and attributed to no instance.
-`GET /memory` reports them under `shared_modules`, never inside an instance.
+`GET /instances/usage` reports them under `shared_modules`, never inside an
+instance.
 
 Capacity for a shared pool is resolved across every server that declares it.
 Declarations should agree; when they do not, the pool is reported as
@@ -185,8 +186,8 @@ that would hide a misconfiguration.
   without bound across a churning fleet. Its surviving L2 bytes are still
   reported, without a ratio.
 
-An instance appears in `GET /memory` when it is registered, when it holds
-bytes, or when it has declared capacity — so a deregistered server whose L2
+An instance appears in `GET /instances/usage` when it is registered, when it
+holds bytes, or when it has declared capacity — so a deregistered server whose L2
 placements survive is not silently dropped.
 
 ## Scope

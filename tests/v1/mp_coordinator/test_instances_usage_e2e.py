@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""End-to-end tests for the fleet memory-pressure API.
+"""End-to-end tests for the fleet memory-usage API.
 
-Drives a uvicorn-served coordinator over real sockets: register with module
-capacities, publish to ``POST /events``, read ``GET /memory``. Bodies use the
-same ``CacheEventsRequest`` dump ``HttpCacheEventSink`` sends, so the wire
-encoding under test is the real one.
+Drives a uvicorn-served coordinator over real sockets: register, declare
+capacities and publish usage to ``POST /events``, read
+``GET /instances/usage``. Bodies use the same ``CacheEventsRequest`` dump
+``HttpCacheEventSink`` sends, so the wire encoding under test is the real
+one.
 """
 
 # Standard
@@ -179,8 +180,8 @@ def _instance(fleet: dict, instance_id: str) -> dict:
     return found[0]
 
 
-def test_pressure_from_registration_and_events_over_real_http(coordinator) -> None:
-    """Capacity in on registration, usage in on the event stream, joined on read."""
+def test_usage_and_capacity_join_over_real_http(coordinator) -> None:
+    """Both halves arrive on the event stream and are joined on read."""
     _register(
         coordinator,
         "mp-1",
@@ -199,7 +200,7 @@ def test_pressure_from_registration_and_events_over_real_http(coordinator) -> No
     _publish(coordinator, "mp-1", Tier.L2, "fs", 50 * GIB, index=2, seq=2)
     _publish(coordinator, "mp-2", Tier.L1, "dram", 60 * GIB, index=3, seq=1)
 
-    fleet = requests.get(f"{coordinator}/memory", timeout=2).json()
+    fleet = requests.get(f"{coordinator}/instances/usage", timeout=2).json()
     assert [i["instance_id"] for i in fleet["instances"]] == ["mp-1", "mp-2"]
 
     mp1 = _instance(fleet, "mp-1")
@@ -211,7 +212,7 @@ def test_pressure_from_registration_and_events_over_real_http(coordinator) -> No
     assert mp2["registered"] is True
 
     # The per-instance endpoint agrees with the fleet view.
-    single = requests.get(f"{coordinator}/memory/mp-1", timeout=2).json()
+    single = requests.get(f"{coordinator}/instances/mp-1/usage", timeout=2).json()
     assert single == mp1
 
 
@@ -223,7 +224,7 @@ def test_undeclared_capacity_serializes_as_null_over_the_wire(coordinator) -> No
     _register(coordinator, "mp-1", [])
     _publish(coordinator, "mp-1", Tier.L2, "fs", 7 * GIB, index=1)
 
-    body = requests.get(f"{coordinator}/memory/mp-1", timeout=2).json()
+    body = requests.get(f"{coordinator}/instances/mp-1/usage", timeout=2).json()
     module = _module(body, "l2", "fs")
     assert module["used_bytes"] == 7 * GIB
     assert module["capacity_bytes"] == 0
@@ -231,7 +232,7 @@ def test_undeclared_capacity_serializes_as_null_over_the_wire(coordinator) -> No
     assert body["declared_capacity"] is False
     # Raw text, so a client-side default cannot mask a missing null.
     assert '"usage_ratio":null' in requests.get(
-        f"{coordinator}/memory/mp-1", timeout=2
+        f"{coordinator}/instances/mp-1/usage", timeout=2
     ).text.replace(" ", "")
 
 
@@ -250,7 +251,7 @@ def test_shared_pool_counted_once_across_mounts_over_real_http(coordinator) -> N
     _publish(coordinator, "mp-1", Tier.L2, "s3", 25 * GIB, index=1, shared=True)
     _publish(coordinator, "mp-2", Tier.L2, "s3", 25 * GIB, index=1, shared=True)
 
-    fleet = requests.get(f"{coordinator}/memory", timeout=2).json()
+    fleet = requests.get(f"{coordinator}/instances/usage", timeout=2).json()
     assert len(fleet["shared_modules"]) == 1
     pool = fleet["shared_modules"][0]
     assert pool["used_bytes"] == 25 * GIB
@@ -277,7 +278,7 @@ def test_restart_fences_l1_but_keeps_l2_over_real_http(coordinator) -> None:
         coordinator, "mp-1", Tier.L2, "fs", 50 * GIB, index=2, seq=2, incarnation=1
     )
 
-    before = requests.get(f"{coordinator}/memory/mp-1", timeout=2).json()
+    before = requests.get(f"{coordinator}/instances/mp-1/usage", timeout=2).json()
     assert _module(before, "l1", "dram")["used_bytes"] == 10 * GIB
 
     # Restart: same instance, higher incarnation, seq restarts at 1.
@@ -285,7 +286,7 @@ def test_restart_fences_l1_but_keeps_l2_over_real_http(coordinator) -> None:
         coordinator, "mp-1", Tier.L1, "dram", 2 * GIB, index=5, seq=1, incarnation=2
     )
 
-    after = requests.get(f"{coordinator}/memory/mp-1", timeout=2).json()
+    after = requests.get(f"{coordinator}/instances/mp-1/usage", timeout=2).json()
     assert _module(after, "l1", "dram")["used_bytes"] == 2 * GIB
     assert _module(after, "l2", "fs")["used_bytes"] == 50 * GIB
 
@@ -309,14 +310,17 @@ def test_delete_releases_bytes_over_real_http(coordinator) -> None:
         event_type=CacheEventType.DELETE,
     )
 
-    body = requests.get(f"{coordinator}/memory/mp-1", timeout=2).json()
+    body = requests.get(f"{coordinator}/instances/mp-1/usage", timeout=2).json()
     module = _module(body, "l1", "dram")
     assert module["used_bytes"] == 0
     assert module["usage_ratio"] == pytest.approx(0.0)
 
 
 def test_unknown_instance_is_404_over_real_http(coordinator) -> None:
-    assert requests.get(f"{coordinator}/memory/nobody", timeout=2).status_code == 404
+    assert (
+        requests.get(f"{coordinator}/instances/nobody/usage", timeout=2).status_code
+        == 404
+    )
 
 
 def test_producer_declaration_yields_real_ratios_over_real_http(coordinator) -> None:
@@ -367,7 +371,7 @@ def test_producer_declaration_yields_real_ratios_over_real_http(coordinator) -> 
     _publish(coordinator, "mp-1", Tier.L2, "fs", 50 * GIB, index=3, seq=3)
     _publish(coordinator, "mp-1", Tier.L2, "s3", 9 * GIB, index=4, seq=4, shared=True)
 
-    status = requests.get(f"{coordinator}/memory/mp-1", timeout=2).json()
+    status = requests.get(f"{coordinator}/instances/mp-1/usage", timeout=2).json()
     assert status["declared_capacity"] is True
 
     # Every declared compartment joins, including both hybrid L1 mediums.
@@ -376,7 +380,9 @@ def test_producer_declaration_yields_real_ratios_over_real_http(coordinator) -> 
     assert _module(status, "l2", "fs")["usage_ratio"] == pytest.approx(0.25)
 
     # The uncapped shared bucket is fleet-scoped and has no denominator.
-    pool = requests.get(f"{coordinator}/memory", timeout=2).json()["shared_modules"]
+    pool = requests.get(f"{coordinator}/instances/usage", timeout=2).json()[
+        "shared_modules"
+    ]
     assert [(p["backend"], p["used_bytes"], p["usage_ratio"]) for p in pool] == [
         ("s3", 9 * GIB, None)
     ]

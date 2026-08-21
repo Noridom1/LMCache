@@ -1,10 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fleet memory-pressure endpoints for the MP coordinator.
+"""Memory-usage endpoints for the ``/instances`` collection.
 
 Joins bytes used (``CacheUsageManager``) against capacity declared
 (``ServerConfigRegistry``). Read-only: never evicts, throttles, or pushes.
 A ``null`` ratio means capacity is undeclared, not that the compartment is
 empty.
+
+``GET /instances/usage`` is a literal path under a collection that also
+takes ``{instance_id}`` segments. Routers are discovered alphabetically, so
+``instances_api`` registers first -- harmless while it declares no
+``GET /instances/{instance_id}``, and guarded by a test that would fail if
+one ever shadowed this route.
 """
 
 # Third Party
@@ -138,8 +144,8 @@ def _shared_capacities(
     }
 
 
-@router.get("/memory")
-async def fleet_memory(request: Request) -> FleetMemoryResponse:
+@router.get("/instances/usage")
+async def fleet_usage(request: Request) -> FleetMemoryResponse:
     """Return the memory status of every MP server and shared pool.
 
     Args:
@@ -183,8 +189,8 @@ async def fleet_memory(request: Request) -> FleetMemoryResponse:
     return FleetMemoryResponse(instances=instances, shared_modules=shared)
 
 
-@router.get("/memory/{instance_id}")
-async def instance_memory(instance_id: str, request: Request) -> InstanceMemoryStatus:
+@router.get("/instances/{instance_id}/usage")
+async def instance_usage(instance_id: str, request: Request) -> InstanceMemoryStatus:
     """Return one MP server's memory status.
 
     Args:

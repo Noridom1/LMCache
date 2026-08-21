@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the coordinator's fleet memory-pressure endpoints."""
+"""Tests for the coordinator's ``/instances/usage`` endpoints."""
 
 # Standard
 from typing import cast
@@ -146,7 +146,7 @@ class TestInstanceMemory:
         )
         _ingest(client, "mp-1", Tier.L1, "dram", 10 * GIB, index=1)
 
-        body = client.get("/memory/mp-1").json()
+        body = client.get("/instances/mp-1/usage").json()
         module = _module(body, "l1", "dram")
         assert module["used_bytes"] == 10 * GIB
         assert module["capacity_bytes"] == 40 * GIB
@@ -159,7 +159,7 @@ class TestInstanceMemory:
         _register(client, "mp-1", [])
         _ingest(client, "mp-1", Tier.L2, "fs", 7 * GIB, index=1)
 
-        body = client.get("/memory/mp-1").json()
+        body = client.get("/instances/mp-1/usage").json()
         module = _module(body, "l2", "fs")
         assert module["used_bytes"] == 7 * GIB
         assert module["capacity_bytes"] == 0
@@ -175,7 +175,7 @@ class TestInstanceMemory:
             "mp-1",
             [{"tier": "l1", "backend": "dram", "capacity_bytes": 40 * GIB}],
         )
-        module = _module(client.get("/memory/mp-1").json(), "l1", "dram")
+        module = _module(client.get("/instances/mp-1/usage").json(), "l1", "dram")
         assert module["used_bytes"] == 0
         assert module["usage_ratio"] == pytest.approx(0.0)
 
@@ -185,12 +185,12 @@ class TestInstanceMemory:
             client, "mp-1", [{"tier": "l1", "backend": "dram", "capacity_bytes": GIB}]
         )
         _ingest(client, "mp-1", Tier.L1, "dram", 3 * GIB, index=1)
-        assert _module(client.get("/memory/mp-1").json(), "l1", "dram")[
+        assert _module(client.get("/instances/mp-1/usage").json(), "l1", "dram")[
             "usage_ratio"
         ] == pytest.approx(3.0)
 
     def test_unknown_instance_is_404(self, client: TestClient) -> None:
-        assert client.get("/memory/nobody").status_code == 404
+        assert client.get("/instances/nobody/usage").status_code == 404
 
     def test_deregistered_instance_keeps_surviving_l2_bytes(
         self, client: TestClient
@@ -203,7 +203,7 @@ class TestInstanceMemory:
         _ingest(client, "mp-1", Tier.L2, "fs", 5 * GIB, index=1)
         assert client.delete("/instances/mp-1").status_code == 204
 
-        body = client.get("/memory/mp-1").json()
+        body = client.get("/instances/mp-1/usage").json()
         assert body["registered"] is False
         # Capacity went with the departed process; the bytes did not.
         assert body["declared_capacity"] is False
@@ -227,7 +227,7 @@ class TestFleetMemory:
         _ingest(client, "mp-1", Tier.L1, "dram", 10 * GIB, index=1)
         _ingest(client, "mp-2", Tier.L1, "dram", 60 * GIB, index=2)
 
-        body = client.get("/memory").json()
+        body = client.get("/instances/usage").json()
         ratios = {
             entry["instance_id"]: _module(entry, "l1", "dram")["usage_ratio"]
             for entry in body["instances"]
@@ -248,7 +248,7 @@ class TestFleetMemory:
         _ingest(client, "mp-1", Tier.L2, "s3", 25 * GIB, index=1, shared=True)
         _ingest(client, "mp-2", Tier.L2, "s3", 25 * GIB, index=1, shared=True, seq=1)
 
-        body = client.get("/memory").json()
+        body = client.get("/instances/usage").json()
         assert len(body["shared_modules"]) == 1
         pool = body["shared_modules"][0]
         assert pool["used_bytes"] == 25 * GIB
@@ -287,12 +287,12 @@ class TestFleetMemory:
         )
         _ingest(client, "mp-1", Tier.L2, "s3", 25 * GIB, index=1, shared=True)
 
-        pool = client.get("/memory").json()["shared_modules"][0]
+        pool = client.get("/instances/usage").json()["shared_modules"][0]
         assert pool["capacity_bytes"] == 0
         assert pool["usage_ratio"] is None
 
     def test_empty_fleet(self, client: TestClient) -> None:
-        assert client.get("/memory").json() == {
+        assert client.get("/instances/usage").json() == {
             "instances": [],
             "shared_modules": [],
         }
@@ -307,7 +307,7 @@ class TestRegistration:
             json={"instance_id": "mp-1", "ip": "10.0.0.1", "http_port": 8000},
         )
         assert response.status_code == 200
-        assert client.get("/memory/mp-1").json()["declared_capacity"] is False
+        assert client.get("/instances/mp-1/usage").json()["declared_capacity"] is False
 
     def test_capacity_fields_are_not_accepted_at_registration(
         self, client: TestClient
@@ -326,7 +326,7 @@ class TestRegistration:
             },
         )
         assert response.status_code == 200
-        assert client.get("/memory/mp-1").json()["declared_capacity"] is False
+        assert client.get("/instances/mp-1/usage").json()["declared_capacity"] is False
 
     def test_tier_all_is_rejected(self, client: TestClient) -> None:
         response = client.post(
@@ -388,10 +388,10 @@ class TestCapacityReports:
 
     def _capacity(self, client: TestClient, instance_id: str) -> int:
         """Read back one instance's declared L1 capacity."""
-        body = client.get(f"/memory/{instance_id}").json()
+        body = client.get(f"/instances/{instance_id}/usage").json()
         return _module(body, "l1", "dram")["capacity_bytes"]
 
-    def test_report_updates_capacity_without_re_registration(
+    def test_a_later_report_supersedes_the_declared_capacity(
         self, client: TestClient
     ) -> None:
         _register(
@@ -400,13 +400,13 @@ class TestCapacityReports:
             [{"tier": "l1", "backend": "dram", "capacity_bytes": 40 * GIB}],
         )
         _ingest(client, "mp-1", Tier.L1, "dram", 10 * GIB, index=1)
-        assert _module(client.get("/memory/mp-1").json(), "l1", "dram")[
+        assert _module(client.get("/instances/mp-1/usage").json(), "l1", "dram")[
             "usage_ratio"
         ] == pytest.approx(0.25)
 
         # A device was added at runtime: same server, bigger pool.
         self._post(client, self._report("mp-1", 2, 80 * GIB))
-        assert _module(client.get("/memory/mp-1").json(), "l1", "dram")[
+        assert _module(client.get("/instances/mp-1/usage").json(), "l1", "dram")[
             "usage_ratio"
         ] == pytest.approx(0.125)
 
@@ -459,7 +459,7 @@ class TestCapacityReports:
         self._post(client, self._report("mp-1", 2, 40 * GIB))
         backends = {
             (m["tier"], m["backend"])
-            for m in client.get("/memory/mp-1").json()["modules"]
+            for m in client.get("/instances/mp-1/usage").json()["modules"]
         }
         assert backends == {("l1", "dram")}
 
@@ -467,6 +467,27 @@ class TestCapacityReports:
         _register(client, "mp-1", [])
         _ingest(client, "mp-1", Tier.L1, "dram", 20 * GIB, index=1)
         self._post(client, self._report("mp-1", 1, 40 * GIB))
-        module = _module(client.get("/memory/mp-1").json(), "l1", "dram")
+        module = _module(client.get("/instances/mp-1/usage").json(), "l1", "dram")
         assert module["used_bytes"] == 20 * GIB
         assert module["usage_ratio"] == pytest.approx(0.5)
+
+
+class TestRouting:
+    """``/instances/usage`` is a literal segment on a templated collection."""
+
+    def test_usage_is_not_captured_as_an_instance_id(self, client: TestClient) -> None:
+        # Routers are discovered alphabetically, so instances_api registers
+        # first. If it ever declares GET /instances/{instance_id}, that route
+        # would swallow "usage" and this fleet read would break.
+        _register(client, "mp-1", [])
+        body = client.get("/instances/usage").json()
+        assert "instances" in body and "shared_modules" in body
+        assert [e["instance_id"] for e in body["instances"]] == ["mp-1"]
+
+    def test_an_instance_literally_named_usage_still_resolves(
+        self, client: TestClient
+    ) -> None:
+        # The per-instance route carries a distinct /usage suffix, so the
+        # collection route cannot shadow it even for this id.
+        _register(client, "usage", [])
+        assert client.get("/instances/usage/usage").json()["instance_id"] == "usage"

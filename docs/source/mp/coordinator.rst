@@ -181,9 +181,9 @@ The coordinator's HTTP surface (base URL ``http://localhost:9300``) groups into:
   eviction.
 - **Cache control** -- the ``/cache`` group: cache operations dispatched to a
   named server (warm prefetch, pin/unpin, and delete, with more to come).
-- **Fleet memory** -- the ``/memory`` group: how full each server's memory
-  compartments are, joining event-derived usage against the capacity each
-  server declares when it registers. Read-only.
+- **Fleet memory** -- the ``/instances/usage`` endpoints: how full each
+  server's memory compartments are, joining event-derived usage against the
+  capacity each server declares on the same event stream. Read-only.
 - **CacheBlend fragment lookup** -- ``POST /directory/blend-lookup``: finds
   cached chunk content anywhere inside a query sequence, using the blend index
   derived from the key directory's token bindings. Server-to-coordinator only;
@@ -1140,10 +1140,10 @@ sequence returns ``status`` ``"noop"``.
 Fleet memory
 ------------
 
-The ``/memory`` group reports how full each MP server's memory compartments
-are. A **compartment** is one thing that owns bytes: the L1 pool of a backing
-medium, or one L2 adapter. It is identified by ``(tier, backend)`` -- the same
-pair cache events tag placements with.
+The ``/instances/usage`` endpoints report how full each MP server's memory
+compartments are. A **compartment** is one thing that owns bytes: the L1 pool
+of a backing medium, or one L2 adapter. It is identified by
+``(tier, backend)`` -- the same pair cache events tag placements with.
 
 Two inputs are joined, and both ride the cache-event stream. **Usage** is
 derived from the events the servers already publish. **Capacity** arrives as
@@ -1174,8 +1174,8 @@ on them.
    holding more than its declared capacity means the declaration is wrong, and
    that is worth seeing.
 
-``GET /memory``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+``GET /instances/usage``
+~~~~~~~~~~~~~~~~~~~~~~~~
 
 The whole fleet: every server's compartments, plus the shared pools.
 
@@ -1220,15 +1220,15 @@ whose L2 data outlived it; its L1 bytes are dropped when it goes.
 .. code-block:: bash
 
     # Which servers are most heavily loaded?
-    curl -s http://localhost:9300/memory | jq -r '
+    curl -s http://localhost:9300/instances/usage | jq -r '
       .instances[] | .instance_id as $i | .modules[]
       | select(.usage_ratio != null)
       | "\($i) \(.tier)/\(.backend) \((.usage_ratio*100|floor))%"'
     # -> server-1 l1/dram 25%
     # -> server-2 l1/dram 81%
 
-``GET /memory/{instance_id}``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+``GET /instances/{instance_id}/usage``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 One server's compartments, in the same shape as an entry of ``instances``
 above.
@@ -1243,7 +1243,7 @@ above.
 
 .. code-block:: bash
 
-    curl -s http://localhost:9300/memory/server-1
+    curl -s http://localhost:9300/instances/server-1/usage
 
 A server whose L1 pool uses the default lazy allocator grows its heap on
 demand. Capacity here is the **configured** size, not the grown heap, so a

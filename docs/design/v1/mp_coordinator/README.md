@@ -41,8 +41,8 @@ shape.
 | `GET /cache/prefetches/{instance_id}/{request_id}` | operator/scheduler | poll a warm prefetch |
 | `POST/DELETE /cache/pins` | operator | pin / unpin keys against fleet-wide eviction |
 | `POST /cache/delete` | operator | delete cached objects on a named server |
-| `GET /memory` | operator/scheduler | fleet memory view: per-server, per-module usage vs declared capacity |
-| `GET /memory/{instance_id}` | operator/scheduler | one server's memory compartments |
+| `GET /instances/usage` | operator/scheduler | fleet memory view: per-server, per-module usage vs declared capacity |
+| `GET /instances/{instance_id}/usage` | operator/scheduler | one server's memory compartments |
 
 For server-initiated work (fleet-wide eviction, warm prefetch) a coordinator
 router resolves an instance's address from the registry (`ip` + `http_port`)
@@ -83,7 +83,7 @@ lmcache/v1/mp_coordinator/
     cache_api.py        # /cache/prefetches, /cache/pins, /cache/delete
     events_api.py       # /events (fleet cache-event ingest)
     directory_api.py    # /directory/lookup, /directory/blend-lookup, /directory/keys, ...
-    memory_api.py       # /memory, /memory/{instance_id} (fleet memory pressure)
+    instances_usage_api.py  # /instances/usage, /instances/{id}/usage
 ```
 
 ## Request flow
@@ -219,14 +219,14 @@ state that the cache-control endpoints write, not the reverse.
 
 ## Fleet memory pressure (`server_config.py`)
 
-`GET /memory` answers how full each server's memory compartments are, by
-joining two halves that arrive on different channels at very different
+`GET /instances/usage` answers how full each server's memory compartments
+are, by joining two halves that ride the same channel at very different
 rates: **usage** from `CacheUsageManager.get_bytes_by_instance`, already
-maintained off the admitted cache-event stream, and **capacity** declared by
-the server. Capacity is configuration — it changes at boot and at
-reconfiguration, not per event — so registration carries the baseline and
-`capacity_reports` on `POST /events` carry changes, each a whole declaration
-guarded by a monotonic revision.
+maintained off the admitted cache-event stream, and **capacity** from
+`capacity_reports` on `POST /events`. Capacity is configuration — it changes
+at boot and at reconfiguration, not per event — so a server reports it once
+at startup and again on each change, each report a whole declaration fenced
+by `(incarnation, revision)`.
 
 The endpoint adds no usage tracking of its own: the per-instance,
 per-backend rollup it needs is exactly what the usage manager publishes.
