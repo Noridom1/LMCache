@@ -76,19 +76,18 @@ def decode_tokens(tokens_b64: str) -> np.ndarray:
 
 
 class ModuleCapacityModel(BaseModel):
-    """One memory compartment's declared capacity, sent at registration.
+    """One compartment's declared capacity: the L1 pool or one L2 adapter.
 
-    A compartment is the L1 pool or one L2 adapter, on the same
-    ``(tier, backend)`` axis cache events report placements on.
+    Keyed on the same ``(tier, backend)`` axis cache events use.
 
     Attributes:
         tier: ``l1`` or ``l2``; ``all`` is rejected.
-        backend: Storage backend within the tier (``"dram"``, ``"s3"``, ...).
+        backend: Backend within the tier (``"dram"``, ``"s3"``, ...).
             Non-empty.
-        capacity_bytes: Declared capacity. ``0`` means undeclared, reported as
-            unknown rather than as full.
-        shared: ``True`` when several instances mount this pool, so its
-            capacity must not be summed.
+        capacity_bytes: Declared capacity. ``0`` means undeclared --
+            reported as unknown, not as full.
+        shared: Set when instances mount this pool, so its capacity must
+            not be summed.
     """
 
     tier: Tier
@@ -105,7 +104,7 @@ class ModuleCapacityModel(BaseModel):
             value: The submitted tier.
 
         Returns:
-            The validated tier.
+            ``value``, unchanged.
 
         Raises:
             ValueError: If ``value`` is ``Tier.ALL``.
@@ -116,17 +115,17 @@ class ModuleCapacityModel(BaseModel):
 
 
 class ServerCapacityReport(BaseModel):
-    """One server's full capacity declaration, sent when its topology changes.
+    """One server's capacity declaration, sent when its topology changes.
 
-    A whole declaration, never a delta: a dropped report is repaired by the
-    next one instead of leaving the coordinator permanently wrong.
+    Always a whole declaration, never a delta, so a dropped report is
+    repaired by the next instead of leaving the coordinator wrong.
 
     Attributes:
         instance_id: The declaring server. Non-empty.
         revision: Monotonic per-process counter. The coordinator ignores a
-            report whose revision it has already passed, so reports that
-            arrive out of order cannot regress the topology. Resets when the
-            server restarts, which is why a registration overrides it.
+            revision it has already passed, so out-of-order reports cannot
+            regress the topology. Resets on restart, which is why a
+            registration overrides it.
         modules: The server's current compartments, replacing any prior set.
     """
 
@@ -152,14 +151,13 @@ class RegisterRequest(BaseModel):
         mq_port: Port of the instance's ZMQ message-queue server that P2P peers
             send lookup/unlock RPCs to, reachable at the instance's ``ip``.
             Optional -- 0 when P2P is disabled.
-        memory_modules: Per-compartment memory capacities (L1 pool, one entry
-            per L2 adapter). Empty means nothing was declared, and usage is
-            then reported without a pressure ratio. A re-registration replaces
-            the previous declaration wholesale.
+        memory_modules: Per-compartment capacities (the L1 pool, one entry
+            per L2 adapter). Empty declares nothing, and usage is then
+            reported without a ratio. A re-registration replaces the
+            previous declaration wholesale.
         capacity_revision: The revision ``memory_modules`` was taken at.
-            Registration is authoritative and resets the coordinator's stored
-            revision, so a restarted server whose counter went backwards is
-            still accepted.
+            Registration resets the coordinator's stored revision, so a
+            restarted server whose counter went backwards is still accepted.
     """
 
     instance_id: Annotated[str, StringConstraints(strip_whitespace=True)] = ""
@@ -297,15 +295,15 @@ class ModuleMemoryStatus(BaseModel):
     Attributes:
         tier: ``l1`` or ``l2``.
         backend: Storage backend within the tier.
-        shared: ``True`` for a fleet-shared pool, whose bytes are counted
-            once for the fleet, not once per mounting instance.
-        used_bytes: Bytes held, derived from the admitted cache-event stream.
-        capacity_bytes: Declared capacity, or ``0`` when none was declared.
+        shared: Set for a fleet-shared pool, whose bytes are counted once
+            for the fleet, not once per mounting instance.
+        used_bytes: Bytes held, from the admitted cache-event stream.
+        capacity_bytes: Declared capacity, or ``0`` if none was declared.
         usage_ratio: ``used_bytes / capacity_bytes``, or ``None`` when no
-            capacity was declared -- ``None``, not a sentinel, since a number
-            would be read as a real occupancy. Values above ``1.0`` are not
-            clamped: they mean the declared cap disagrees with what the tier
-            admitted.
+            capacity was declared -- ``None`` rather than a sentinel, which
+            would read as real occupancy. Values above ``1.0`` are not
+            clamped: they mean the declared cap disagrees with what the
+            tier admitted.
     """
 
     tier: Tier
@@ -321,10 +319,11 @@ class InstanceMemoryStatus(BaseModel):
 
     Attributes:
         instance_id: The server this describes.
-        registered: ``True`` when currently in the instance registry. A
-            deregistered server can still hold L2 bytes, so ``False`` is valid.
-        declared_capacity: ``True`` when any module capacity was declared.
-            When ``False`` every module's ``usage_ratio`` is ``None``.
+        registered: Whether it is currently in the instance registry. A
+            deregistered server can still hold L2 bytes, so ``False`` is
+            valid.
+        declared_capacity: Whether any capacity was declared. When
+            ``False``, every module's ``usage_ratio`` is ``None``.
         modules: Privately-owned compartments, sorted by tier then backend.
             Shared pools are reported at the fleet level instead.
     """

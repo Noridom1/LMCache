@@ -252,19 +252,18 @@ class EncodedObjectKey:
 
 @dataclass(frozen=True)
 class ModuleMemoryCapacity:
-    """One memory compartment's configured capacity on this server.
+    """One compartment's configured capacity: an L1 medium or an L2 adapter.
 
-    A compartment is the L1 pool of one backing medium, or one L2 adapter --
-    the same ``(tier, backend)`` axis cache events tag placements with.
+    Keyed on the same ``(tier, backend)`` axis cache events use.
 
     Attributes:
         tier: ``Tier.L1`` or ``Tier.L2``.
-        backend: Medium within the tier (``"dram"``, ``"devdax"``, ``"gds"``,
-            or an L2 adapter type name such as ``"s3"``).
-        capacity_bytes: Configured capacity. ``0`` means undeclared, reported
-            as unknown rather than as full.
-        shared: ``True`` when several instances mount this pool, so its
-            capacity must not be summed across them.
+        backend: Medium within the tier (``"dram"``, ``"devdax"``,
+            ``"gds"``, or an L2 adapter type such as ``"s3"``).
+        capacity_bytes: Configured capacity. ``0`` means undeclared --
+            reported as unknown, not as full.
+        shared: Set when instances mount this pool, so its capacity must
+            not be summed across them.
     """
 
     tier: "Tier"
@@ -275,15 +274,15 @@ class ModuleMemoryCapacity:
 
 @dataclass(frozen=True)
 class CapacitySnapshot:
-    """This server's memory capacities and the revision they were taken at.
+    """This server's capacities and the revision they were taken at.
 
-    Read atomically so a reader cannot pair a revision with a different
+    Read atomically, so a reader cannot pair a revision with a different
     topology's modules.
 
     Attributes:
         revision: Monotonic per-process counter, bumped on every capacity
-            change. Restarts at 0, so it orders declarations only within one
-            process incarnation.
+            change. Restarts at 0, so it orders declarations only within
+            one process incarnation.
         modules: One entry per memory compartment.
     """
 

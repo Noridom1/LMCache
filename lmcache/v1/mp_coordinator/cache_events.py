@@ -257,9 +257,9 @@ class CacheEventSubscriber(EventSubscriber):
         try:
             self._sink.publish(batches, reports)
         except CacheEventPublishError as e:
-            # The batches are lost for good; the capacity report is not --
-            # it is a whole declaration, so restoring it lets the next flush
-            # resend it. A newer one arriving first simply supersedes it.
+            # Batches are lost for good, but a capacity report is a whole
+            # declaration, so restore it for the next flush. A newer one
+            # arriving first just supersedes it.
             if capacity is not None and self._pending_capacity is None:
                 self._pending_capacity = capacity
             logger.warning(

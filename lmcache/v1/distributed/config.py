@@ -220,21 +220,20 @@ def configured_l1_capacity_bytes(
     The single source for "how large is L1". Unlike
     ``L1Manager.get_memory_usage()``, whose total is the grown heap on the
     lazy tier, this is stable from boot. Keyed per medium because a hybrid
-    Device-DAX tier spans two, and L1 cache events tag placements the same
-    way. Reports the *configured* topology, so devices added later via
+    Device-DAX tier spans two, matching how L1 events tag placements.
+    Reports the *configured* topology, so devices added later via
     ``add_device`` are not counted.
 
     Expects a **normalized** config: ``normalize_storage_manager_config``
-    back-fills ``devdax_size_in_bytes`` from a matching DAX L2 adapter, so a
-    hand-built config reads as pure Device-DAX where the deployment is
-    hybrid. Callers holding a config from a constructed
-    ``StorageManagerConfig`` satisfy this by construction.
+    back-fills ``devdax_size_in_bytes`` from a matching DAX L2 adapter,
+    without which a hybrid deployment reads as pure Device-DAX. A config
+    from a constructed ``StorageManagerConfig`` satisfies this already.
 
     Args:
         config: The L1 manager configuration.
 
     Returns:
-        Configured bytes per medium, omitting mediums sized zero.
+        Configured bytes per medium, omitting any sized zero.
     """
     if config.gds_l1_config is not None:
         size = config.gds_l1_config.size_in_bytes

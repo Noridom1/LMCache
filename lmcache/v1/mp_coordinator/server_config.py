@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Per-MP-server memory configuration declared at registration.
+"""Per-MP-server memory capacity, as declared by each server.
 
 Cache events report bytes held, never bytes holdable, so servers declare
-capacity on ``POST /instances`` and this registry stores it. Declarations
-only: no event handling, no pressure math, no liveness -- membership stays
-:class:`~lmcache.v1.mp_coordinator.registry.InstanceRegistry`'s job.
+capacity separately and this registry stores it. Storage only -- no event
+handling, no pressure math, no liveness.
 """
 
 # Future
@@ -18,27 +17,24 @@ import threading
 # First Party
 from lmcache.v1.distributed.api import Tier
 
-# ``capacity_bytes`` sentinel meaning "no cap declared". Real caps are always
-# positive; an unlimited adapter reported as 0 would read as permanently full.
+# "No cap declared". Real caps are positive, so an unlimited adapter
+# reporting 0 would otherwise read as permanently full.
 UNDECLARED_CAPACITY = 0
 
 
 @dataclass(frozen=True)
 class ModuleCapacity:
-    """One memory compartment's declared capacity on one MP server.
+    """One compartment's declared capacity: the L1 pool or one L2 adapter.
 
-    A module is the L1 pool or one L2 adapter, keyed on the same
-    ``(tier, backend)`` axis cache events report placements on.
+    Keyed on the same ``(tier, backend)`` axis cache events use.
 
     Attributes:
-        tier: Cache tier (``L1`` or ``L2``; never ``ALL``).
-        backend: Storage backend within the tier (``"dram"``, ``"cxl"``,
-            ``"fs"``, ``"s3"``, ...). Non-empty.
-        capacity_bytes: Declared capacity in bytes, or
-            :data:`UNDECLARED_CAPACITY` when no limit is configured.
-        shared: ``True`` when several instances mount one storage domain
-            (one S3 bucket, one CXL pool). Fleet-scoped: count once, never
-            sum across declaring instances.
+        tier: ``L1`` or ``L2``; never ``ALL``.
+        backend: Backend within the tier (``"dram"``, ``"fs"``, ...).
+            Non-empty.
+        capacity_bytes: Declared bytes, or :data:`UNDECLARED_CAPACITY`.
+        shared: Set when instances mount one storage domain (an S3 bucket,
+            a CXL pool). Count once for the fleet, never per mount.
     """
 
     tier: Tier
@@ -51,7 +47,7 @@ class ModuleCapacity:
 
         Raises:
             ValueError: If ``backend`` is empty, ``capacity_bytes`` is
-                negative, or ``tier`` is not a concrete tier.
+                negative, or ``tier`` is not concrete.
         """
         if not self.backend:
             raise ValueError("backend must be non-empty")
@@ -64,10 +60,10 @@ class ModuleCapacity:
 
 
 class ServerConfigRegistry:
-    """Thread-safe store of each MP server's declared module capacities.
+    """Thread-safe store of each MP server's declared capacities.
 
-    Both writers replace a server's declaration wholesale, so a dropped L2
-    adapter's capacity does not linger. :meth:`declare` is authoritative
+    Both writers replace a declaration wholesale, so a dropped L2 adapter's
+    capacity cannot linger. :meth:`declare` wins unconditionally
     (registration); :meth:`update` is revision-guarded (capacity events).
     """
 
@@ -82,19 +78,18 @@ class ServerConfigRegistry:
     ) -> None:
         """Record ``instance_id``'s capacities from a registration.
 
-        Authoritative: it overwrites whatever revision was stored, because a
-        registration means a (re)started process whose counter may have gone
-        backwards.
+        Overwrites any stored revision: a registration means a (re)started
+        process, whose counter may have gone backwards.
 
         Args:
             instance_id: The declaring server's id. Non-empty.
-            modules: Its compartments. Empty records that the server declared
-                nothing, which reads back as unknown capacity, not zero.
+            modules: Its compartments. Empty means "declared nothing", which
+                reads back as unknown capacity rather than zero.
             revision: The revision ``modules`` was taken at.
 
         Raises:
             ValueError: If ``instance_id`` is empty, or two entries share a
-                ``(tier, backend)`` identity.
+                ``(tier, backend)``.
         """
         self._validate(instance_id, modules)
         with self._lock:
@@ -104,7 +99,7 @@ class ServerConfigRegistry:
     def update(
         self, instance_id: str, modules: Sequence[ModuleCapacity], revision: int
     ) -> bool:
-        """Apply a capacity report, unless it is older than what is stored.
+        """Apply a capacity report unless it is older than what is stored.
 
         Args:
             instance_id: The declaring server's id. Non-empty.
@@ -112,11 +107,11 @@ class ServerConfigRegistry:
             revision: The revision ``modules`` was taken at.
 
         Returns:
-            ``True`` when applied, ``False`` when the report was superseded.
+            ``True`` when applied, ``False`` when already superseded.
 
         Raises:
             ValueError: If ``instance_id`` is empty, or two entries share a
-                ``(tier, backend)`` identity.
+                ``(tier, backend)``.
         """
         self._validate(instance_id, modules)
         with self._lock:
@@ -128,15 +123,10 @@ class ServerConfigRegistry:
 
     @staticmethod
     def _validate(instance_id: str, modules: Sequence[ModuleCapacity]) -> None:
-        """Reject an empty id or two entries for one compartment.
-
-        Args:
-            instance_id: The declaring server's id.
-            modules: The compartments being declared.
+        """Reject an empty id, or two entries for one compartment.
 
         Raises:
-            ValueError: If ``instance_id`` is empty, or two entries share a
-                ``(tier, backend)`` identity.
+            ValueError: On either.
         """
         if not instance_id:
             raise ValueError("instance_id must be non-empty")
@@ -157,8 +147,7 @@ class ServerConfigRegistry:
             instance_id: The server to look up.
 
         Returns:
-            Its declarations, or an empty tuple when the server is unknown
-            or declared nothing.
+            Its declarations; empty when unknown or nothing was declared.
         """
         with self._lock:
             return self._by_instance.get(instance_id, ())

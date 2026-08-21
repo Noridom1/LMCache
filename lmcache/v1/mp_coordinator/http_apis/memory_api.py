@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fleet memory-pressure endpoints for the MP coordinator.
 
-Joins per-compartment byte totals (``CacheUsageManager``'s per-instance
-rollup) with the capacities declared at registration
-(``ServerConfigRegistry``). Read-only: never evicts, throttles, or pushes. A
-``null`` usage ratio means capacity is undeclared, not that the compartment
-is empty.
+Joins bytes used (``CacheUsageManager``) against capacity declared
+(``ServerConfigRegistry``). Read-only: never evicts, throttles, or pushes.
+A ``null`` ratio means capacity is undeclared, not that the compartment is
+empty.
 """
 
 # Third Party
@@ -24,8 +23,8 @@ from lmcache.v1.mp_coordinator.server_config import UNDECLARED_CAPACITY, ModuleC
 
 router = APIRouter()
 
-# ``CacheUsageManager`` keys fleet-shared pools under this instance id: their
-# bytes belong to the fleet, so they are counted once, never per mount.
+# ``CacheUsageManager`` keys fleet-shared pools under this instance id.
+# Their bytes belong to the fleet: counted once, never per mount.
 _SHARED_OWNER = ""
 
 _TIERS = (Tier.L1, Tier.L2)
@@ -34,10 +33,7 @@ _TIERS = (Tier.L1, Tier.L2)
 def _usage_by_owner(
     usage_manager: CacheUsageManager,
 ) -> dict[str, dict[tuple[Tier, str], int]]:
-    """Collect used bytes for every owner across both tiers.
-
-    Args:
-        usage_manager: The fleet usage view.
+    """Collect used bytes per owner across both tiers.
 
     Returns:
         ``instance_id`` -> ``(tier, backend)`` -> bytes. Shared pools appear
@@ -56,16 +52,9 @@ def _to_status(
 ) -> ModuleMemoryStatus:
     """Join one compartment's usage to its declared capacity.
 
-    Args:
-        tier: The compartment's cache tier.
-        backend: Storage backend within the tier.
-        used_bytes: Bytes the compartment holds.
-        capacity_bytes: Declared capacity, or :data:`UNDECLARED_CAPACITY`.
-        shared: Whether this is a fleet-shared pool.
-
     Returns:
-        The joined status; ``usage_ratio`` is ``None`` with no capacity to
-        divide by.
+        The joined status. ``usage_ratio`` is ``None`` when there is no
+        capacity to divide by.
     """
     return ModuleMemoryStatus(
         tier=tier,
@@ -89,17 +78,11 @@ def _instance_status(
 ) -> InstanceMemoryStatus:
     """Build one server's status from its usage and its declaration.
 
-    Declared-but-empty compartments report ``used_bytes=0`` so a freshly
+    Declared-but-empty compartments report ``used_bytes=0``, so a freshly
     started server does not look unmonitored.
 
-    Args:
-        instance_id: The server being described.
-        used: Its ``(tier, backend)`` byte totals.
-        declared: Its declared capacities.
-        registered: Whether it is currently in the instance registry.
-
     Returns:
-        The assembled status.
+        The assembled status, compartments sorted by ``(tier, backend)``.
     """
     capacities = {(m.tier, m.backend): m.capacity_bytes for m in declared}
     statuses = [
@@ -134,15 +117,13 @@ def _shared_capacities(
 ) -> dict[tuple[Tier, str], int]:
     """Resolve each shared pool's capacity across its declaring servers.
 
-    One pool is one store, so declarations should agree. A disagreement reads
-    as undeclared rather than picking one, which would make the answer depend
-    on registration order.
-
-    Args:
-        declarations: Every server's declared compartments.
+    One pool is one store, so declarations should agree. Disagreement reads
+    as undeclared -- picking one would make the answer depend on
+    registration order.
 
     Returns:
-        ``(tier, backend)`` -> agreed capacity, or :data:`UNDECLARED_CAPACITY`.
+        ``(tier, backend)`` -> agreed capacity, else
+        :data:`UNDECLARED_CAPACITY`.
     """
     claims: dict[tuple[Tier, str], set[int]] = {}
     for modules in declarations.values():
@@ -162,12 +143,12 @@ async def fleet_memory(request: Request) -> FleetMemoryResponse:
     """Return the memory status of every MP server and shared pool.
 
     Args:
-        request: The incoming request, carrying the coordinator context.
+        request: Carries the coordinator context.
 
     Returns:
-        A :class:`FleetMemoryResponse`. A server appears when it is
-        registered, still holds bytes, or declared capacity, so a
-        deregistered server whose L2 placements survive is not dropped.
+        A :class:`FleetMemoryResponse`. A server appears if it is
+        registered, still holds bytes, or declared capacity -- so one that
+        deregistered with L2 placements surviving is not dropped.
     """
     ctx = get_context(request)
     declarations = ctx.server_config.get_all()
@@ -208,14 +189,14 @@ async def instance_memory(instance_id: str, request: Request) -> InstanceMemoryS
 
     Args:
         instance_id: The server to report on.
-        request: The incoming request, carrying the coordinator context.
+        request: Carries the coordinator context.
 
     Returns:
         That server's :class:`InstanceMemoryStatus`.
 
     Raises:
-        HTTPException: 404 when the coordinator knows nothing about the id --
-            not registered, holding no bytes, and having declared nothing.
+        HTTPException: 404 when the id is unknown -- not registered, holding
+            no bytes, and having declared nothing.
     """
     ctx = get_context(request)
     declared = ctx.server_config.get(instance_id)

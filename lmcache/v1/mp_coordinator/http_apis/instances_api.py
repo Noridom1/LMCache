@@ -113,8 +113,8 @@ async def deregister_instance(instance_id: str, request: Request) -> Response:
         logger.info("Deregistered instance %s", instance_id)
     else:
         logger.info("Instance %s not registered, skipping deregistration", instance_id)
-    # Dropped with the membership; otherwise declarations grow without
-    # bound across a churning fleet. Surviving L2 bytes lose their ratio.
+    # Dropped with the membership, or declarations grow without bound
+    # across a churning fleet. Surviving L2 bytes lose their ratio.
     ctx.server_config.forget(instance_id)
     return Response(status_code=204)
 

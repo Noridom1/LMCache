@@ -849,11 +849,11 @@ class L1Manager:
     def get_configured_capacity_bytes(self) -> dict[L1BackendType, int]:
         """Return the configured capacity of each L1 backing medium.
 
-        Unlike :meth:`get_memory_usage`'s total, which can be the grown heap,
-        this is the declared size and is stable from boot.
+        Unlike :meth:`get_memory_usage`'s total, which can be the grown
+        heap, this is the declared size and is stable from boot.
 
         Returns:
-            Configured bytes per medium; mediums sized zero are omitted.
+            Configured bytes per medium, omitting any sized zero.
         """
         return configured_l1_capacity_bytes(self._config)
 
@@ -887,7 +887,7 @@ class L1Manager:
         used, total = self._memory_manager.get_memory_usage()
         # ``memory_total_bytes`` is what the allocator currently backs (the
         # grown heap on the lazy tier); this is the declared size. Summed to
-        # match this dict's flat shape; ``0`` means undeclared.
+        # fit this dict's flat shape; ``0`` means undeclared.
         return {
             "is_healthy": self._memory_manager.memcheck(),
             "total_object_count": len(self._objects),

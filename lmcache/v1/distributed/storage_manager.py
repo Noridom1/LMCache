@@ -88,8 +88,8 @@ class StorageManager:
         self._next_adapter_id = 0
         # Serializes add_l2_adapter / delete_l2_adapter against each other.
         self._lifecycle_lock = threading.Lock()
-        # Bumped whenever the capacity topology changes, so the
-        # coordinator can reject a declaration that arrived late.
+        # Bumped on every capacity-topology change, so the coordinator can
+        # reject a declaration that arrives late.
         self._capacity_revision = 0
         # Guards the _l2_adapters and _adapter_descriptors dicts.
         self._adapters_lock = threading.Lock()
@@ -841,15 +841,15 @@ class StorageManager:
     def get_memory_capacities(self) -> CapacitySnapshot:
         """Report every memory compartment's configured capacity.
 
-        Sent to the coordinator at registration and joined there against
-        event-derived usage. L1 is reported per backing medium; L2 per
-        adapter, keeping each adapter's ``shared`` flag so a pool several
+        Sent to the coordinator at registration, where it is joined against
+        event-derived usage. L1 is reported per backing medium, L2 per
+        adapter, each keeping its ``shared`` flag so a pool several
         instances mount is counted once. An adapter whose ``get_usage()``
-        raises is skipped rather than reported with a wrong capacity.
+        raises is skipped rather than given a wrong capacity.
 
         Returns:
             The current revision and one entry per compartment.
-            ``capacity_bytes == 0`` means the adapter declares no limit.
+            ``capacity_bytes == 0`` means no declared limit.
         """
         with self._lifecycle_lock:
             return CapacitySnapshot(
@@ -968,8 +968,8 @@ class StorageManager:
         """Bump the revision and announce the new topology.
 
         Call with ``_lifecycle_lock`` held. The event carries the whole
-        declaration rather than a delta, so a dropped one is repaired by
-        the next instead of leaving the coordinator permanently wrong.
+        declaration, not a delta, so a dropped one is repaired by the next
+        rather than leaving the coordinator permanently wrong.
         """
         self._capacity_revision += 1
         self._event_bus.publish(
